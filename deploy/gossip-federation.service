@@ -1,0 +1,38 @@
+[Unit]
+Description=Gossip Federation Discovery Service
+Documentation=https://github.com/taylorsatula/gossip-federation
+After=network.target postgresql.service vault.service
+Requires=postgresql.service vault.service
+
+[Service]
+Type=simple
+User=federation
+Group=federation
+WorkingDirectory=/opt/gossip-federation
+Environment="PATH=/opt/gossip-federation/venv/bin:/usr/local/bin:/usr/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# Federation discovery daemon runs on port 8302
+ExecStart=/opt/gossip-federation/venv/bin/python -m uvicorn gossip_federation.discovery_daemon:app \
+    --host 0.0.0.0 \
+    --port 8302 \
+    --workers 1 \
+    --log-level info
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/gossip-federation/logs /opt/gossip-federation/data
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
