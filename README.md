@@ -367,6 +367,94 @@ A new server `new-clinic` wants to join the federation:
 
 ---
 
+## Network Topology Confidence
+
+The system uses a **network visibility saturation model** to determine when it has a strong view of the federation topology. This prevents domain collisions and ensures reliable routing.
+
+### How Confidence is Calculated
+
+During domain verification queries, the system tracks how many **new peers** are discovered:
+
+```
+New Peers Discovered → Base Confidence
+─────────────────────────────────────
+0 peers              → 0.95 (full visibility)
+1-2 peers            → 0.80 (good visibility)
+3-5 peers            → 0.60 (moderate visibility)
+6+ peers             → 0.40 (limited visibility)
+```
+
+**Intuition:** If a query traverses the network and discovers no new peers, the system has likely seen the entire reachable topology. Discovering many new peers indicates unexplored network regions.
+
+Final confidence is adjusted by query coverage:
+```
+confidence = base_confidence × (servers_queried / total_neighbors)
+```
+
+### When Searching Stops
+
+Queries terminate when any of these conditions are met:
+
+| Condition | Description |
+|-----------|-------------|
+| **Domain found** | Immediate return with endpoint info |
+| **Max hops reached** | Query exhausted its hop budget |
+| **Duplicate query** | Same query_id seen before (loop prevention) |
+
+**Hop limits vary by use case:**
+
+| Operation | Max Hops | Rationale |
+|-----------|----------|-----------|
+| Domain verification (registration) | 20 | Thorough federation-wide search |
+| Route resolution (messaging) | 10 | Balance between coverage and latency |
+| Default query | 5 | Quick lookups for known domains |
+
+### Strong Topology Detection
+
+The system considers itself to have a **strong topology view** when:
+
+1. **Confidence ≥ 0.8** - Few or no new peers discovered during queries
+2. **Query coverage is high** - Most neighbors responded to verification
+3. **Multiple hops completed** - Query propagated through multiple network layers
+
+```
+                    Query with max_hops=20
+                            │
+           ┌────────────────┼────────────────┐
+           ▼                ▼                ▼
+       neighbor-1       neighbor-2       neighbor-3
+           │                │                │
+     (no new peers)   (1 new peer)    (no new peers)
+           │                │                │
+           └────────────────┼────────────────┘
+                            ▼
+                  Confidence = 0.95 × (3/3) = 0.95
+                            │
+                            ▼
+                  "Strong topology - safe to register"
+```
+
+### Query Deduplication
+
+Prevents infinite loops in circular topologies:
+
+- Each query has a unique `query_id`
+- Servers cache seen query IDs for 5 minutes
+- Duplicate queries are ignored (return "not found")
+- Cache uses LRU eviction (max 1000 entries)
+
+### Confidence Thresholds
+
+| Threshold | Action |
+|-----------|--------|
+| ≥ 0.8 | Domain registration allowed |
+| 0.6 - 0.79 | Registration blocked (insufficient visibility) |
+| < 0.6 | Registration blocked, recommend more bootstrap servers |
+
+**Manual Override:** Low-confidence registration can be forced with `allow_low_confidence=True`, but this risks domain collisions if the network has unseen partitions.
+
+---
+
 ## Security Model
 
 ### Cryptography
@@ -541,7 +629,8 @@ See [docs/LATTICE_VAULT_SETUP.md](docs/LATTICE_VAULT_SETUP.md) for Vault configu
 | **Circuit Breaker** | Pattern that stops trying unresponsive peers temporarily |
 | **Hop** | One step in query forwarding; `hop_count` limits propagation depth |
 | **Fingerprint** | Short hash of public key for identification |
-| **Confidence** | 0.0-1.0 score indicating route reliability (decays per hop) |
+| **Confidence** | 0.0-1.0 score indicating route reliability (decays 10% per hop) or network visibility (based on new peer discovery during queries) |
+| **Network Visibility** | How much of the federation topology is known; high visibility (few new peers discovered) yields high confidence |
 
 ---
 
