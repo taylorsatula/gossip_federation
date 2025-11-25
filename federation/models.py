@@ -110,7 +110,7 @@ class DomainQuery(BaseModel):
     query_id: str = Field(description="Unique query identifier")
     domain: str = Field(description="Domain to resolve (e.g., other-server.com)")
     requester: str = Field(description="Server making the query")
-    max_hops: int = Field(default=5, ge=1, le=10, description="Maximum hops for query")
+    max_hops: int = Field(default=5, ge=1, le=50, description="Maximum hops for query")
     timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
 
     @field_validator('domain')

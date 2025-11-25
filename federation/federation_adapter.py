@@ -94,7 +94,7 @@ class FederationAdapter:
         message_type: str = "pager",
         location: Optional[Dict[str, Any]] = None,
         device_secret: Optional[str] = None,
-        sender_fingerprint: str = None
+        sender_fingerprint: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Queue a message for federated delivery.

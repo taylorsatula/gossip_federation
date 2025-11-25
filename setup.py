@@ -13,8 +13,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/taylorsatula/gossip-federation",
-    package_dir={"": "src"},
-    packages=find_packages(where="src"),
+    packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
@@ -47,7 +46,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "gossip-federation=gossip_federation.discovery_daemon:main",
+            "gossip-federation=federation.discovery_daemon:main",
         ],
     },
 )

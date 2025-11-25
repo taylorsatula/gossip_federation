@@ -120,7 +120,7 @@ def __init__(self):
 ## Performance
 
 - **Message delivery**: Every 1 minute (configurable via scheduler)
-- **Gossip rounds**: Every 1 hour
+- **Gossip rounds**: Every 10 minutes
 - **Neighbor updates**: Every 6 hours
 - **Cleanup**: Daily
 - **Crash recovery**: On daemon startup, all 'sending' → 'pending'
@@ -129,7 +129,7 @@ def __init__(self):
 
 ## Production Deployment
 
-See `FEDERATION_TODO.md` for complete setup instructions.
+See `FEDERATION_VAULT_SETUP.md` and `FEDERATION_SYSTEMD.md` for setup instructions.
 
 **Required:**
 1. Apply database schema (`deploy/federation_schema.sql`)

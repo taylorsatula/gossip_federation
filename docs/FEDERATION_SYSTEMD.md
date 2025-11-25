@@ -203,7 +203,7 @@ sudo netstat -tlnp | grep 8302
 
 The main MIRA application (port 1993) schedules periodic HTTP calls to the discovery daemon:
 
-- **Gossip rounds**: `POST http://localhost:8302/api/v1/announce` (every hour)
+- **Gossip rounds**: `POST http://localhost:8302/api/v1/announce` (every 10 minutes)
 - **Neighbor updates**: `POST http://localhost:8302/api/v1/maintenance/update_neighbors` (every 6 hours)
 - **Cleanup**: `POST http://localhost:8302/api/v1/maintenance/cleanup` (daily)
 

@@ -172,7 +172,7 @@ def _register_federation_scheduler_jobs(scheduler_service):
 
     discovery_daemon_url = "http://localhost:8302"
 
-    # Gossip announcement - every hour
+    # Gossip announcement - every 10 minutes
     def call_gossip_endpoint():
         try:
             with httpx.Client(timeout=10.0) as client:
@@ -226,7 +226,7 @@ def _register_federation_scheduler_jobs(scheduler_service):
     scheduler_service.register_job(
         job_id="federation_gossip",
         func=call_gossip_endpoint,
-        trigger=IntervalTrigger(hours=1),
+        trigger=IntervalTrigger(minutes=10),
         component="federation",
         description="Trigger federation gossip round via discovery daemon"
     )

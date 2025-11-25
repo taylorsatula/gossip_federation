@@ -227,6 +227,7 @@ class GossipProtocol:
                 return None
 
             # Create announcement
+            from .models import ServerEndpoints
             announcement = ServerAnnouncement(
                 server_id=self._server_id,
                 server_uuid=self._server_uuid,
@@ -234,10 +235,10 @@ class GossipProtocol:
                     encoding=serialization.Encoding.PEM,
                     format=serialization.PublicFormat.SubjectPublicKeyInfo
                 ).decode('utf-8'),
-                endpoints={
-                    "federation": f"{app_url}/api/federation",
-                    "discovery": f"{app_url}/api/discovery"
-                }
+                endpoints=ServerEndpoints(
+                    federation=f"{app_url}/api/federation",
+                    discovery=f"{app_url}/api/discovery"
+                )
             )
 
             # Sign the announcement
@@ -323,17 +324,9 @@ class GossipProtocol:
                 logger.info(f"Received {len(exchange.peers)} peers from {exchange.from_server}")
                 return True
 
-            elif message.message_type == "domain_query":
-                query = DomainQuery(**message.payload)
-                # Process domain query
-                return self._handle_domain_query(query, message.from_server)
-
-            elif message.message_type == "domain_response":
-                response = DomainResponse(**message.payload)
-                # Process domain response
-                return self._handle_domain_response(response)
-
             else:
+                # Note: domain_query and domain_response have dedicated endpoints
+                # (/api/v1/domain/query) and should not come through gossip
                 logger.warning(f"Unknown gossip message type: {message.message_type}")
                 return False
 

@@ -304,11 +304,11 @@ class DiscoveryService:
             cutoff = utc_now() - timedelta(minutes=5)
             before_count = len(self._processed_queries)
 
-            self._processed_queries = {
-                qid: timestamp
+            self._processed_queries = OrderedDict(
+                (qid, timestamp)
                 for qid, timestamp in self._processed_queries.items()
                 if timestamp > cutoff
-            }
+            )
 
             removed = before_count - len(self._processed_queries)
             if removed > 0:
@@ -361,9 +361,7 @@ class DiscoveryService:
                     delivered += 1
                 except Exception as e:
                     logger.error(f"Failed to deliver message {msg['message_id']}: {e}")
-                    # Record failure for circuit breaker
-                    if 'to_domain' in msg:
-                        self._record_delivery_failure(msg['to_domain'])
+                    # Circuit breaker is recorded in _deliver_single_message
                     self._handle_delivery_failure(msg, str(e))
                     failed += 1
 
@@ -442,9 +440,22 @@ class DiscoveryService:
         message_id = msg['message_id']
         to_domain = msg['to_domain']
 
-        # Check circuit breaker first
-        if not self._check_circuit_breaker(to_domain):
-            raise ValueError(f"Circuit breaker open for {to_domain}")
+        # Resolve recipient domain first to get server_id
+        peer = self.peer_manager.get_peer_by_domain(to_domain)
+
+        if not peer:
+            raise ValueError(f"No route to domain: {to_domain}")
+
+        # Use server_id for consistent circuit breaker and reputation tracking
+        server_id = peer['server_id']
+
+        # Check circuit breaker using resolved server_id
+        if not self._check_circuit_breaker(server_id):
+            raise ValueError(f"Circuit breaker open for {server_id}")
+
+        if peer['trust_status'] == 'blocked':
+            self._fail_message_permanently(message_id, "Recipient server is blocked")
+            return
 
         # Update status to sending
         self.db.execute_update(
@@ -452,22 +463,12 @@ class DiscoveryService:
             (message_id,)
         )
 
-        # Resolve recipient domain
-        peer = self.peer_manager.get_peer_by_domain(to_domain)
-
-        if not peer:
-            raise ValueError(f"No route to domain: {to_domain}")
-
-        if peer['trust_status'] == 'blocked':
-            self._fail_message_permanently(message_id, "Recipient server is blocked")
-            return
-
         # Get federation endpoint
         endpoints = peer.get('endpoints', {})
         federation_url = endpoints.get('federation')
 
         if not federation_url:
-            raise ValueError(f"No federation endpoint for {to_domain}")
+            raise ValueError(f"No federation endpoint for {server_id}")
 
         # Construct federated message
         from .models import FederatedMessage
@@ -492,15 +493,15 @@ class DiscoveryService:
 
         if response and response.get('status') == 'accepted':
             # Mark as delivered and reset circuit breaker
-            self._record_delivery_success(to_domain)
+            self._record_delivery_success(server_id)
             # Update peer reputation positively
-            self.peer_manager.update_peer_reputation(to_domain, delta=0.05)
+            self.peer_manager.update_peer_reputation(server_id, delta=0.05)
             self._complete_message(message_id)
-            logger.info(f"Message {message_id} delivered to {to_domain}")
+            logger.info(f"Message {message_id} delivered to {server_id}")
         else:
-            self._record_delivery_failure(to_domain)
+            self._record_delivery_failure(server_id)
             # Update peer reputation negatively
-            self.peer_manager.update_peer_reputation(to_domain, delta=-0.1)
+            self.peer_manager.update_peer_reputation(server_id, delta=-0.1)
             raise ValueError(f"Remote server rejected message: {response}")
 
     def _send_to_remote_server(self, url: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -626,7 +627,7 @@ app = FastAPI(
 # CORS middleware for local access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:*"],
+    allow_origin_regex=r"http://localhost(:\d+)?",
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -990,6 +991,30 @@ async def receive_gossip(message: GossipMessage):
             "SELECT public_key, server_uuid FROM federation_peers WHERE server_id = %s",
             (message.from_server,)
         )
+
+        # Rate limiting: 100 gossip messages per minute per peer
+        if sender:
+            rate_check = discovery_service.db.execute_single(
+                """
+                UPDATE federation_peers
+                SET query_count = CASE
+                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < NOW()
+                        THEN 1
+                        ELSE query_count + 1
+                    END,
+                    rate_limit_reset_at = CASE
+                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < NOW()
+                        THEN NOW() + INTERVAL '1 minute'
+                        ELSE rate_limit_reset_at
+                    END
+                WHERE server_id = %s
+                RETURNING query_count
+                """,
+                (message.from_server,)
+            )
+            if rate_check and rate_check['query_count'] > 100:
+                logger.warning(f"Rate limit exceeded for gossip from {message.from_server}")
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
         # For announcements, verify public key authenticity
         if message.message_type == "announcement":
