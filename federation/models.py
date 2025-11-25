@@ -5,11 +5,79 @@ Defines the protocol for gossip-based server discovery and message federation.
 All messages are cryptographically signed for authenticity.
 """
 
+import ipaddress
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Literal, Any
+from urllib.parse import urlparse
+
 from pydantic import BaseModel, Field, field_validator
 from utils.timezone_utils import utc_now
+
+
+# =====================================================================
+# URL VALIDATION HELPERS (SSRF Protection)
+# =====================================================================
+
+def _is_internal_address(hostname: str) -> bool:
+    """
+    Check if hostname is an internal/link-local address.
+
+    Blocks:
+    - Loopback (127.x.x.x, ::1)
+    - Private networks (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
+    - Link-local (169.254.x.x, fe80::)
+    - Reserved/unspecified addresses
+    - Known localhost hostnames
+    """
+    # Check for localhost hostnames
+    if hostname.lower() in ("localhost", "localhost.localdomain"):
+        return True
+
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return (
+            ip.is_private or
+            ip.is_loopback or
+            ip.is_link_local or
+            ip.is_reserved or
+            ip.is_unspecified
+        )
+    except ValueError:
+        # Not an IP address - it's a hostname, allow it
+        # (DNS resolution happens at request time, not validation time)
+        return False
+
+
+def _validate_endpoint_url(url: str) -> str:
+    """
+    Validate an endpoint URL for SSRF protection.
+
+    Raises ValueError if URL points to internal/link-local address.
+    """
+    if not url:
+        raise ValueError("Endpoint URL cannot be empty")
+
+    parsed = urlparse(url)
+
+    if not parsed.scheme:
+        raise ValueError(f"Endpoint URL must include scheme (http/https): {url}")
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Endpoint URL must use http or https scheme: {url}")
+
+    if not parsed.netloc:
+        raise ValueError(f"Endpoint URL must include host: {url}")
+
+    # Extract hostname (remove port if present)
+    hostname = parsed.netloc.split(':')[0]
+
+    if _is_internal_address(hostname):
+        raise ValueError(
+            f"Endpoint URL cannot point to internal/link-local address: {url}"
+        )
+
+    return url
 
 
 # =====================================================================
@@ -27,6 +95,12 @@ class ServerEndpoints(BaseModel):
     """Service endpoints for federation communication."""
     federation: str = Field(description="Federation message endpoint URL")
     discovery: str = Field(description="Discovery/gossip endpoint URL")
+
+    @field_validator('federation', 'discovery')
+    @classmethod
+    def validate_endpoint_not_internal(cls, v):
+        """Validate endpoint URLs don't point to internal addresses (SSRF protection)."""
+        return _validate_endpoint_url(v)
 
 
 class ServerAnnouncement(BaseModel):

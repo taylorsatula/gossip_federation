@@ -12,9 +12,9 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Dict, Any, List, Optional
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 
 from clients.postgres_client import PostgresClient
@@ -63,21 +63,33 @@ class RouteQueryResponse(BaseModel):
     from_cache: bool = Field(default=False, description="Whether result came from cache")
 
 
-class ReputationReportRequest(BaseModel):
-    """Report server reputation (good/bad behavior)."""
-    server_id: str
-    report_type: str = Field(description="Type of report: 'success', 'failure', 'spam'")
-    details: Optional[str] = None
-
-
 class PeerStatus(BaseModel):
     """Status information about a peer."""
     server_id: str
     is_neighbor: bool
     trust_status: str
-    reputation_score: float
     last_seen: str
     endpoints: Dict[str, str]
+
+
+# =====================================================================
+# Access Control
+# =====================================================================
+
+async def localhost_only(request: Request):
+    """
+    FastAPI dependency that restricts endpoint access to localhost only.
+
+    Use this for admin/maintenance endpoints that should not be exposed
+    to the network (health checks, peer listings, maintenance tasks).
+    """
+    client_ip = request.client.host if request.client else None
+    if client_ip not in ("127.0.0.1", "::1"):
+        raise HTTPException(
+            status_code=403,
+            detail="This endpoint is restricted to localhost only"
+        )
+    return client_ip
 
 
 # =====================================================================
@@ -446,7 +458,7 @@ class DiscoveryService:
         if not peer:
             raise ValueError(f"No route to domain: {to_domain}")
 
-        # Use server_id for consistent circuit breaker and reputation tracking
+        # Use server_id for consistent circuit breaker tracking
         server_id = peer['server_id']
 
         # Check circuit breaker using resolved server_id
@@ -494,14 +506,10 @@ class DiscoveryService:
         if response and response.get('status') == 'accepted':
             # Mark as delivered and reset circuit breaker
             self._record_delivery_success(server_id)
-            # Update peer reputation positively
-            self.peer_manager.update_peer_reputation(server_id, delta=0.05)
             self._complete_message(message_id)
             logger.info(f"Message {message_id} delivered to {server_id}")
         else:
             self._record_delivery_failure(server_id)
-            # Update peer reputation negatively
-            self.peer_manager.update_peer_reputation(server_id, delta=-0.1)
             raise ValueError(f"Remote server rejected message: {response}")
 
     def _send_to_remote_server(self, url: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -624,13 +632,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware for local access
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"http://localhost(:\d+)?",
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
 
 
 # =====================================================================
@@ -638,8 +639,8 @@ app.add_middleware(
 # =====================================================================
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint."""
+async def health_check(_: str = Depends(localhost_only)):
+    """Health check endpoint (localhost only)."""
     return {
         "status": "healthy",
         "service": "discovery_daemon",
@@ -696,13 +697,14 @@ async def announce_server(request: AnnouncementRequest, background_tasks: Backgr
 
 @app.get("/api/v1/peers")
 async def list_peers(
+    _: str = Depends(localhost_only),
     active_only: bool = True,
     include_blocked: bool = False
 ) -> List[PeerStatus]:
-    """Get list of known peer servers."""
+    """Get list of known peer servers (localhost only)."""
     try:
         query = """
-            SELECT server_id, is_neighbor, trust_status, reputation_score,
+            SELECT server_id, is_neighbor, trust_status,
                    last_seen_at, endpoints
             FROM federation_peers
             WHERE 1=1
@@ -716,7 +718,7 @@ async def list_peers(
         if not include_blocked:
             query += " AND trust_status != 'blocked'"
 
-        query += " ORDER BY is_neighbor DESC, reputation_score DESC"
+        query += " ORDER BY is_neighbor DESC, last_seen_at DESC"
 
         peers = discovery_service.db.execute_query(query, tuple(params))
 
@@ -725,7 +727,6 @@ async def list_peers(
                 server_id=p['server_id'],
                 is_neighbor=p['is_neighbor'],
                 trust_status=p['trust_status'],
-                reputation_score=p['reputation_score'],
                 last_seen=p['last_seen_at'].isoformat(),
                 endpoints=p['endpoints']
             )
@@ -923,65 +924,6 @@ async def resolve_route(domain: str) -> RouteQueryResponse:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/v1/reputation/report")
-async def report_reputation(report: ReputationReportRequest):
-    """Report server behavior for reputation tracking."""
-    try:
-        # Map report type to reputation delta
-        delta_map = {
-            "success": 0.1,      # Successful message delivery
-            "failure": -0.05,    # Failed delivery
-            "spam": -0.3,        # Spam or abuse
-            "timeout": -0.1,     # Timeout/unresponsive
-        }
-
-        delta = delta_map.get(report.report_type, 0.0)
-        if delta == 0.0:
-            raise ValueError(f"Unknown report type: {report.report_type}")
-
-        discovery_service.peer_manager.update_peer_reputation(report.server_id, delta)
-
-        return {
-            "status": "accepted",
-            "server_id": report.server_id,
-            "reputation_change": delta
-        }
-
-    except Exception as e:
-        logger.error(f"Error reporting reputation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/v1/reputation/{server_id}")
-async def get_reputation(server_id: str):
-    """Get reputation score for a specific server."""
-    try:
-        result = discovery_service.db.execute_single(
-            """
-            SELECT reputation_score, trust_status, last_seen_at
-            FROM federation_peers
-            WHERE server_id = %s
-            """,
-            (server_id,)
-        )
-
-        if not result:
-            raise HTTPException(status_code=404, detail="Server not found")
-
-        return {
-            "server_id": server_id,
-            "reputation_score": result['reputation_score'],
-            "trust_status": result['trust_status'],
-            "last_seen": result['last_seen_at'].isoformat()
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting reputation for {server_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/api/v1/gossip/receive")
 async def receive_gossip(message: GossipMessage):
     """Receive gossip message from another server."""
@@ -1033,7 +975,7 @@ async def receive_gossip(message: GossipMessage):
             else:
                 # Unknown server - only accept if from bootstrap servers
                 # This prevents arbitrary servers from joining without introduction
-                bootstrap_domains = [url.split('//')[1].split('/')[0].split(':')[0] for url in discovery_service.bootstrap_servers]
+                bootstrap_domains = [urlparse(url).hostname for url in discovery_service.bootstrap_servers if urlparse(url).hostname]
                 if message.from_server not in bootstrap_domains:
                     logger.warning(
                         f"Rejecting announcement from unknown server '{message.from_server}'. "
@@ -1154,9 +1096,12 @@ async def register_domain(request: DomainRegistrationRequest):
 
 
 @app.post("/api/v1/maintenance/update_neighbors")
-async def trigger_neighbor_update(background_tasks: BackgroundTasks):
+async def trigger_neighbor_update(
+    _: str = Depends(localhost_only),
+    background_tasks: BackgroundTasks = None
+):
     """
-    Trigger neighbor selection update (called by main MIRA scheduler).
+    Trigger neighbor selection update (called by main MIRA scheduler, localhost only).
 
     This endpoint is designed to be called by the main MIRA application's
     scheduler service rather than having the discovery daemon manage its own scheduling.
@@ -1173,9 +1118,9 @@ async def trigger_neighbor_update(background_tasks: BackgroundTasks):
 
 
 @app.post("/api/v1/maintenance/process_messages")
-async def process_message_queue():
+async def process_message_queue(_: str = Depends(localhost_only)):
     """
-    Process pending federated messages for delivery (called by main MIRA scheduler).
+    Process pending federated messages for delivery (called by main MIRA scheduler, localhost only).
 
     This endpoint processes messages queued in the federation_messages table
     and attempts to deliver them to remote servers.
@@ -1192,9 +1137,9 @@ async def process_message_queue():
 
 
 @app.post("/api/v1/maintenance/cleanup")
-async def trigger_cleanup():
+async def trigger_cleanup(_: str = Depends(localhost_only)):
     """
-    Trigger cleanup of stale data (called by main MIRA scheduler).
+    Trigger cleanup of stale data (called by main MIRA scheduler, localhost only).
 
     This endpoint is designed to be called by the main MIRA application's
     scheduler service rather than having the discovery daemon manage its own scheduling.

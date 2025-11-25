@@ -44,11 +44,9 @@ CREATE TABLE IF NOT EXISTS federation_peers (
 
     -- Neighbor management
     is_neighbor BOOLEAN NOT NULL DEFAULT FALSE,
-    neighbor_score NUMERIC(5,3) DEFAULT 0.5,  -- 0.0-1.0 score for neighbor selection
 
-    -- Trust and reputation
+    -- Trust status (manual designation)
     trust_status VARCHAR(50) NOT NULL DEFAULT 'unknown' CHECK (trust_status IN ('unknown', 'trusted', 'untrusted', 'blocked')),
-    reputation_score NUMERIC(5,3) DEFAULT 0.5 CHECK (reputation_score >= 0 AND reputation_score <= 1),
 
     -- Rate limiting
     query_count INTEGER DEFAULT 0,
@@ -69,8 +67,14 @@ COMMENT ON COLUMN federation_peers.trust_status IS 'Manual trust designation for
 CREATE INDEX IF NOT EXISTS idx_federation_peers_serverid ON federation_peers(server_id);
 CREATE INDEX IF NOT EXISTS idx_federation_peers_uuid ON federation_peers(server_uuid);
 CREATE INDEX IF NOT EXISTS idx_federation_peers_neighbors ON federation_peers(is_neighbor) WHERE is_neighbor = TRUE;
-CREATE INDEX IF NOT EXISTS idx_federation_peers_neighbor_selection ON federation_peers(is_neighbor, neighbor_score DESC) WHERE is_neighbor = TRUE;
 CREATE INDEX IF NOT EXISTS idx_federation_peers_trust ON federation_peers(trust_status);
+
+-- NOTE: Reputation scoring was considered but removed as premature optimization.
+-- If spam/abuse becomes a problem, consider adding:
+-- - reputation_score NUMERIC(5,3) column
+-- - neighbor_score NUMERIC(5,3) column
+-- - idx_federation_peers_neighbor_selection index
+-- See application code comments for details.
 
 -- =====================================================================
 -- FEDERATION ROUTING CACHE

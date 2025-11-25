@@ -1,7 +1,14 @@
 """
 Peer management for federation gossip protocol.
 
-Handles neighbor selection, peer scoring, and connection management.
+Handles neighbor selection and connection management.
+
+NOTE: Reputation scoring was considered but removed as premature optimization.
+If spam/abuse becomes a problem in the future, consider adding:
+- reputation_score column (0.0-1.0) updated on delivery success/failure
+- neighbor_score = reputation * 0.7 + recency * 0.3
+- Reputation-weighted neighbor selection
+See git history for original implementation.
 """
 
 import logging
@@ -132,7 +139,7 @@ class PeerManager:
                 WHERE is_neighbor = true
                   AND trust_status != 'blocked'
                   AND last_seen_at > %(cutoff_time)s
-                ORDER BY neighbor_score DESC, last_seen_at DESC
+                ORDER BY last_seen_at DESC
                 """,
                 {'cutoff_time': utc_now() - timedelta(hours=24)}
             )
@@ -164,112 +171,102 @@ class PeerManager:
             logger.error(f"Error selecting new neighbors: {e}")
 
     def _add_new_neighbors(self, count: int) -> None:
-        """Add new neighbors from available peers."""
+        """Add new neighbors from available peers (random selection from recent peers)."""
         try:
-            # Get candidate peers (not blocked, recently seen, not already neighbors)
+            # Get all candidate peers (not blocked, recently seen, not already neighbors)
             candidates = self.db.execute_query(
                 """
-                SELECT server_id,
-                       reputation_score,
-                       EXTRACT(EPOCH FROM (NOW() - last_seen_at))/3600 as hours_ago
+                SELECT server_id
                 FROM federation_peers
                 WHERE is_neighbor = false
                   AND trust_status != 'blocked'
                   AND last_seen_at > %(cutoff_time)s
-                ORDER BY reputation_score DESC, last_seen_at DESC
-                LIMIT %(limit_count)s
                 """,
-                {'cutoff_time': utc_now() - timedelta(days=7), 'limit_count': count * 2}
+                {'cutoff_time': utc_now() - timedelta(days=7)}
             )
 
             if not candidates:
                 logger.info("No eligible peers to add as neighbors")
                 return
 
-            # Randomly select from top candidates (introduces diversity)
+            # Randomly select from all eligible candidates (pure random for network diversity)
             selected = random.sample(candidates, min(count, len(candidates)))
 
             for peer in selected:
-                # Calculate neighbor score based on reputation and recency
-                # Clamp hours_ago to non-negative (clock skew protection)
-                hours_ago = max(0, peer['hours_ago'])
-                recency_factor = max(0.1, 1.0 - (hours_ago / 168))  # Decay over 1 week
-                neighbor_score = peer['reputation_score'] * 0.7 + recency_factor * 0.3
-
                 self.db.execute_update(
                     """
                     UPDATE federation_peers
-                    SET is_neighbor = true,
-                        neighbor_score = %(neighbor_score)s
+                    SET is_neighbor = true
                     WHERE server_id = %(server_id)s
                     """,
-                    {'neighbor_score': neighbor_score, 'server_id': peer['server_id']}
+                    {'server_id': peer['server_id']}
                 )
-                logger.info(f"Added neighbor: {peer['server_id']} (score: {neighbor_score:.2f})")
+                logger.info(f"Added neighbor: {peer['server_id']}")
 
         except Exception as e:
             logger.error(f"Error adding new neighbors: {e}")
 
     def _replace_poor_neighbors(self) -> None:
-        """Replace low-scoring neighbors with better candidates."""
+        """
+        Occasionally rotate a random neighbor for network diversity.
+
+        With random neighbor selection, we still want some rotation to discover
+        new peers and maintain network health. Randomly replace one neighbor
+        with another eligible peer.
+        """
         try:
-            # Get worst performing neighbor
-            worst_neighbor = self.db.execute_single(
+            # Get a random current neighbor
+            current_neighbor = self.db.execute_single(
                 """
-                SELECT server_id, neighbor_score
+                SELECT server_id
                 FROM federation_peers
                 WHERE is_neighbor = true
-                ORDER BY neighbor_score ASC
+                ORDER BY RANDOM()
                 LIMIT 1
                 """
             )
 
-            if not worst_neighbor:
+            if not current_neighbor:
                 return
 
-            # Get best non-neighbor candidate
-            best_candidate = self.db.execute_single(
+            # Get a random non-neighbor candidate
+            candidate = self.db.execute_single(
                 """
-                SELECT server_id, reputation_score
+                SELECT server_id
                 FROM federation_peers
                 WHERE is_neighbor = false
                   AND trust_status != 'blocked'
                   AND last_seen_at > %(cutoff_time)s
-                ORDER BY reputation_score DESC
+                ORDER BY RANDOM()
                 LIMIT 1
                 """,
                 {'cutoff_time': utc_now() - timedelta(days=7)}
             )
 
-            if not best_candidate:
+            if not candidate:
                 return
 
-            # Replace if candidate is significantly better
-            if best_candidate['reputation_score'] > worst_neighbor['neighbor_score'] + 0.2:
+            # Swap them (20% chance to actually rotate for stability)
+            if random.random() < 0.2:
                 # Remove old neighbor
                 self.db.execute_update(
                     "UPDATE federation_peers SET is_neighbor = false WHERE server_id = %(server_id)s",
-                    {'server_id': worst_neighbor['server_id']}
+                    {'server_id': current_neighbor['server_id']}
                 )
 
                 # Add new neighbor
                 self.db.execute_update(
-                    """
-                    UPDATE federation_peers
-                    SET is_neighbor = true,
-                        neighbor_score = %(neighbor_score)s
-                    WHERE server_id = %(server_id)s
-                    """,
-                    {'neighbor_score': best_candidate['reputation_score'], 'server_id': best_candidate['server_id']}
+                    "UPDATE federation_peers SET is_neighbor = true WHERE server_id = %(server_id)s",
+                    {'server_id': candidate['server_id']}
                 )
 
                 logger.info(
-                    f"Replaced neighbor {worst_neighbor['server_id']} "
-                    f"with {best_candidate['server_id']}"
+                    f"Rotated neighbor {current_neighbor['server_id']} "
+                    f"with {candidate['server_id']}"
                 )
 
         except Exception as e:
-            logger.error(f"Error replacing poor neighbors: {e}")
+            logger.error(f"Error rotating neighbors: {e}")
 
     def get_peer_by_domain(self, domain: str) -> Optional[Dict[str, Any]]:
         """
@@ -314,42 +311,6 @@ class PeerManager:
         except Exception as e:
             logger.error(f"Error getting peer by domain {domain}: {e}")
             return None
-
-    def update_peer_reputation(self, server_id: str, delta: float) -> None:
-        """
-        Update peer reputation score.
-
-        Args:
-            server_id: Server to update
-            delta: Amount to change reputation by (-1.0 to 1.0)
-        """
-        try:
-            self.db.execute_update(
-                """
-                UPDATE federation_peers
-                SET reputation_score = GREATEST(0.0, LEAST(1.0, reputation_score + %(delta)s))
-                WHERE server_id = %(server_id)s
-                """,
-                {'delta': delta, 'server_id': server_id}
-            )
-
-            # Update neighbor score if this is a neighbor (include recency)
-            self.db.execute_update(
-                """
-                UPDATE federation_peers
-                SET neighbor_score = reputation_score * 0.7 +
-                    (CASE
-                        WHEN EXTRACT(EPOCH FROM (NOW() - last_seen_at)) / 3600 < 168
-                        THEN GREATEST(0.1, 1.0 - (EXTRACT(EPOCH FROM (NOW() - last_seen_at)) / 3600 / 168))
-                        ELSE 0.1
-                    END) * 0.3
-                WHERE server_id = %(server_id)s AND is_neighbor = true
-                """,
-                {'server_id': server_id}
-            )
-
-        except Exception as e:
-            logger.error(f"Error updating reputation for {server_id}: {e}")
 
     def is_blocked(self, server_id: str) -> bool:
         """Check if a server is blocked."""

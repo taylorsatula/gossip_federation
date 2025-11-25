@@ -294,7 +294,7 @@ class GossipProtocol:
                     announcement_time = parse_utc_time_string(announcement.timestamp)
                     age = utc_now() - announcement_time
 
-                    if age > timedelta(hours=24):
+                    if age > timedelta(hours=1):
                         logger.warning(f"Stale announcement from {announcement.server_id} (age: {age})")
                         return False
 

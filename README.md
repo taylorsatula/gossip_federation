@@ -10,7 +10,7 @@ Federation allows MIRA servers to discover each other and exchange pager message
 - **Decentralized**: No central registry or coordinator
 - **Cryptographically Secure**: All messages signed with RSA-2048
 - **Resilient**: Gossip protocol ensures eventual consistency
-- **Spam-Resistant**: Rate limiting, reputation scoring, circuit breakers
+- **Spam-Resistant**: Rate limiting, circuit breakers, trust levels
 
 ---
 
@@ -79,7 +79,7 @@ The `server_uuid` is the true identity. If a server renames from `acme-medical` 
 │              All Known Peers            │
 │  ┌───────────────────────────────────┐  │
 │  │         Active Neighbors          │  │
-│  │  (max 8, selected by score)       │  │
+│  │  (max 8, randomly selected)       │  │
 │  │                                   │  │
 │  │   [peer-a] [peer-b] [peer-c]     │  │
 │  │   [peer-d] [peer-e] [peer-f]     │  │
@@ -92,9 +92,7 @@ The `server_uuid` is the true identity. If a server renames from `acme-medical` 
 └─────────────────────────────────────────┘
 ```
 
-Neighbors are selected based on:
-- **Reputation score** (70% weight): Track record of successful interactions
-- **Recency** (30% weight): How recently we've heard from them
+Neighbors are selected randomly from peers seen within the last 7 days. This random selection provides network diversity and resilience against partitioning.
 
 ### Addresses
 
@@ -134,7 +132,7 @@ Servers periodically announce themselves to neighbors:
 ```
 
 **Validation Rules:**
-- Timestamp must be within 24 hours (prevents replay attacks)
+- Timestamp must be within 1 hour (prevents replay attacks)
 - Clock skew tolerance: +/-5 minutes
 - Signature must verify against included public key
 - If server_id already known with different UUID -> collision, reject
@@ -251,7 +249,7 @@ Taylor on `acme-medical` sends a page to Alex on `city-hospital`:
 6. POSTs signed message to `city-hospital`'s federation endpoint
 7. Remote server verifies signature, checks rate limits, delivers to Alex
 8. Returns `{"status": "accepted"}`
-9. Local daemon marks message as delivered, updates reputation
+9. Local daemon marks message as delivered
 
 ### Example 2: Gossip Round
 
@@ -280,7 +278,7 @@ Every 10 minutes, servers announce themselves to neighbors:
                    └───────────────┘
 
 Each recipient:
-- Validates timestamp (< 24h old)
+- Validates timestamp (< 1h old)
 - Verifies signature
 - Updates peer record (last_seen_at, endpoints, etc.)
 - May forward to their neighbors (epidemic spread)
