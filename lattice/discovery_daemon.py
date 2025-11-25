@@ -696,6 +696,34 @@ async def health_check(_: str = Depends(localhost_only)):
     }
 
 
+@app.get("/api/v1/identity")
+async def get_server_identity():
+    """Get this server's federation identity."""
+    try:
+        identity = discovery_service.db.execute_single(
+            "SELECT server_id, server_uuid, fingerprint, created_at FROM lattice_identity WHERE id = 1"
+        )
+
+        if not identity:
+            raise HTTPException(
+                status_code=404,
+                detail="Federation identity not configured"
+            )
+
+        return {
+            "server_id": identity['server_id'],
+            "server_uuid": identity['server_uuid'],
+            "fingerprint": identity['fingerprint'],
+            "created_at": identity['created_at']
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting identity: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/announcement")
 async def get_server_announcement():
     """Get this server's announcement for bootstrap discovery."""

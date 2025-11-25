@@ -48,10 +48,27 @@ docker run -d \
 | Endpoint | Description |
 |----------|-------------|
 | `GET /health` | Health check |
+| `GET /api/v1/identity` | Get server federation identity |
 | `GET /api/v1/peers` | List known peers |
 | `POST /api/v1/announce` | Trigger gossip round |
 | `POST /api/v1/gossip/receive` | Receive announcements |
 | `POST /api/v1/route/{domain}` | Resolve domain to endpoint |
+
+### Integration with External Systems
+
+External systems (like MIRA) must configure the username resolver before federated message delivery works:
+
+```python
+from lattice.username_resolver import set_username_resolver
+
+def resolve_username(username: str) -> Optional[str]:
+    # Query your user database for username -> user_id mapping
+    result = your_db.query("SELECT user_id FROM users WHERE username = ?", username)
+    return str(result.user_id) if result else None
+
+# Call at application startup
+set_username_resolver(resolve_username)
+```
 
 ---
 
