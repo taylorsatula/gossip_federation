@@ -130,6 +130,11 @@ class DiscoveryService:
         self.last_gossip_time = None
         self.bootstrap_servers: List[str] = []
 
+        # Status tracking for /status and /health endpoints
+        self.start_time = utc_now()
+        self.maintenance_mode = False
+        self.cached_saturation: float = 0.0
+
         # Circuit breaker settings (state persisted in lattice_peers table)
         self._circuit_breaker_threshold = 5  # failures
         self._circuit_breaker_timeout = timedelta(minutes=15)
@@ -220,6 +225,9 @@ class DiscoveryService:
             self.last_gossip_time = utc_now()
             logger.info(f"Completed gossip round to {gossip_count} neighbors")
 
+            # Update saturation metric after gossip
+            self._update_saturation()
+
         except Exception as e:
             logger.error(f"Error in gossip round: {e}")
 
@@ -261,6 +269,65 @@ class DiscoveryService:
     def _update_neighbors(self):
         """Update neighbor selection."""
         self.peer_manager.select_new_neighbors()
+
+    def _update_saturation(self):
+        """
+        Calculate and cache network saturation metric.
+
+        Saturation represents network visibility - how much of the reachable
+        network this server has discovered. Based on peer discovery patterns:
+        - 1.0 = Full visibility (no new peers being discovered)
+        - 0.0 = Just started (still discovering the network)
+
+        Called after gossip rounds to update the cached value.
+        """
+        try:
+            # Get current peer counts
+            peer_stats = self.db.execute_single(
+                """
+                SELECT
+                    COUNT(*) as total_peers,
+                    COUNT(CASE WHEN is_neighbor = 1 THEN 1 END) as neighbors,
+                    COUNT(CASE WHEN last_seen_at > datetime('now', '-1 hour') THEN 1 END) as recently_active
+                FROM lattice_peers
+                WHERE trust_status != 'blocked'
+                """
+            )
+
+            total_peers = peer_stats['total_peers'] if peer_stats else 0
+            neighbors = peer_stats['neighbors'] if peer_stats else 0
+            recently_active = peer_stats['recently_active'] if peer_stats else 0
+
+            if total_peers == 0:
+                # No peers yet - just starting
+                self.cached_saturation = 0.0
+                return
+
+            # Saturation based on network stability:
+            # - High neighbor ratio = well-connected
+            # - High activity ratio = healthy network
+            # Use a heuristic combining these factors
+
+            # Target: ~10 neighbors is considered "saturated" for small networks
+            # Scale up for larger networks
+            target_neighbors = max(10, total_peers // 5)
+            neighbor_saturation = min(1.0, neighbors / target_neighbors)
+
+            # Activity ratio: what fraction of known peers are recently active
+            activity_ratio = recently_active / total_peers if total_peers > 0 else 0.0
+
+            # Combined saturation: weighted average
+            # Neighbor connectivity matters more than activity
+            self.cached_saturation = (0.7 * neighbor_saturation) + (0.3 * activity_ratio)
+
+            logger.debug(
+                f"Saturation updated: {self.cached_saturation:.2f} "
+                f"(peers={total_peers}, neighbors={neighbors}, active={recently_active})"
+            )
+
+        except Exception as e:
+            logger.error(f"Error calculating saturation: {e}")
+            # Keep previous value on error
 
     def _cleanup_stale_data(self):
         """Clean up old data."""
@@ -685,15 +752,102 @@ app = FastAPI(
 # API Endpoints
 # =====================================================================
 
+@app.get("/status")
+async def public_status():
+    """
+    Public status endpoint for external network participants.
+
+    Returns lightweight information useful for deciding whether to interact
+    with this server. No authentication required.
+    """
+    try:
+        # Get peer count
+        peer_count_result = discovery_service.db.execute_single(
+            "SELECT COUNT(*) as count FROM lattice_peers WHERE trust_status != 'blocked'"
+        )
+        peer_count = peer_count_result['count'] if peer_count_result else 0
+
+        return {
+            "alive": True,
+            "accepting_messages": not discovery_service.maintenance_mode,
+            "peer_count": peer_count,
+            "saturation": round(discovery_service.cached_saturation, 2),
+            "version": "1.0.0"
+        }
+
+    except Exception as e:
+        logger.error(f"Error in status endpoint: {e}")
+        # Even on error, return basic alive status
+        return {
+            "alive": True,
+            "accepting_messages": not discovery_service.maintenance_mode,
+            "peer_count": 0,
+            "saturation": 0.0,
+            "version": "1.0.0"
+        }
+
+
 @app.get("/health")
 async def health_check(_: str = Depends(localhost_only)):
-    """Health check endpoint (localhost only)."""
-    return {
-        "status": "healthy",
-        "service": "discovery_daemon",
-        "server_id": discovery_service.gossip_protocol.get_server_id(),
-        "last_gossip": discovery_service.last_gossip_time.isoformat() if discovery_service.last_gossip_time else None
-    }
+    """
+    Detailed health check endpoint (localhost only).
+
+    Returns granular operational details for internal monitoring,
+    admin tools, and the main application checking on the daemon.
+    """
+    try:
+        # Get queue statistics
+        queue_stats = discovery_service.db.execute_single(
+            """
+            SELECT
+                COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
+                COUNT(CASE WHEN status = 'sending' THEN 1 END) as sending,
+                COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
+            FROM lattice_messages
+            WHERE expires_at > datetime('now')
+            """
+        )
+
+        # Get circuit breaker statistics
+        circuit_stats = discovery_service.db.execute_single(
+            """
+            SELECT
+                COUNT(*) as total_peers,
+                COUNT(CASE WHEN circuit_open_until > datetime('now') THEN 1 END) as open_circuits
+            FROM lattice_peers
+            WHERE trust_status != 'blocked'
+            """
+        )
+
+        # Calculate uptime
+        uptime_seconds = int((utc_now() - discovery_service.start_time).total_seconds())
+
+        return {
+            "status": "healthy",
+            "service": "discovery_daemon",
+            "server_id": discovery_service.gossip_protocol.get_server_id(),
+            "last_gossip": discovery_service.last_gossip_time.isoformat() if discovery_service.last_gossip_time else None,
+            "maintenance_mode": discovery_service.maintenance_mode,
+            "queues": {
+                "pending": queue_stats['pending'] if queue_stats else 0,
+                "sending": queue_stats['sending'] if queue_stats else 0,
+                "failed": queue_stats['failed'] if queue_stats else 0
+            },
+            "circuit_breakers": {
+                "open": circuit_stats['open_circuits'] if circuit_stats else 0,
+                "total_peers": circuit_stats['total_peers'] if circuit_stats else 0
+            },
+            "saturation": round(discovery_service.cached_saturation, 2),
+            "uptime_seconds": uptime_seconds
+        }
+
+    except Exception as e:
+        logger.error(f"Error in health endpoint: {e}")
+        return {
+            "status": "degraded",
+            "service": "discovery_daemon",
+            "error": str(e)
+        }
 
 
 @app.get("/api/v1/identity")
