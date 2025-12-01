@@ -2,6 +2,8 @@
 
 A decentralized peer-to-peer protocol for cross-server messaging without a central coordinator.
 
+Primarily developed to allow [taylorsatula/mira-OSS]([docs/ARCHITECTURE.md](https://github.com/taylorsatula/mira-OSS)) instances to communicate in airgapped systems and after the root servers at [miraos.org](https://miraos.org) are shut down someday in the far-future.
+
 ## Overview
 
 Lattice allows servers to discover each other and exchange messages across server boundaries. Users can send messages to `user@remote-server` just like email, but for real-time messaging.
