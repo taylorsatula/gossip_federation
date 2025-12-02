@@ -192,7 +192,7 @@ CREATE TABLE IF NOT EXISTS lattice_identity (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     server_id TEXT NOT NULL,
     server_uuid TEXT NOT NULL,
-    private_key_vault_path TEXT NOT NULL,
+    private_key_path TEXT NOT NULL,
     public_key TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
 

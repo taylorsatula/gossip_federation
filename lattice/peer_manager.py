@@ -13,11 +13,10 @@ See git history for original implementation.
 
 import logging
 import random
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 from .sqlite_client import SQLiteClient
-from utils.timezone_utils import utc_now
 from .models import ServerAnnouncement, KeyRotation, IdentityRevocation
 
 logger = logging.getLogger(__name__)
@@ -88,7 +87,7 @@ class PeerManager:
 
             import json
             import uuid as uuid_module
-            last_seen = utc_now().isoformat()
+            last_seen = datetime.now(timezone.utc).isoformat()
             peer_data = {
                 'server_id': announcement.server_id,
                 'server_uuid': announcement.server_uuid,
@@ -146,7 +145,7 @@ class PeerManager:
             List of neighbor peer records
         """
         try:
-            cutoff_time = (utc_now() - timedelta(hours=24)).isoformat()
+            cutoff_time = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
             neighbors = self.db.execute_query(
                 """
                 SELECT server_id, endpoints, public_key, last_seen_at
@@ -189,7 +188,7 @@ class PeerManager:
         """Add new neighbors from available peers (random selection from recent peers)."""
         try:
             # Get all candidate peers (not blocked, recently seen, not already neighbors)
-            cutoff_time = (utc_now() - timedelta(days=7)).isoformat()
+            cutoff_time = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
             candidates = self.db.execute_query(
                 """
                 SELECT server_id
@@ -246,7 +245,7 @@ class PeerManager:
                 return
 
             # Get a random non-neighbor candidate
-            cutoff_time = (utc_now() - timedelta(days=7)).isoformat()
+            cutoff_time = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
             candidate = self.db.execute_single(
                 """
                 SELECT server_id
@@ -369,7 +368,7 @@ class PeerManager:
             Number of peers cleaned up
         """
         try:
-            cutoff_time = (utc_now() - timedelta(days=days)).isoformat()
+            cutoff_time = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
             result = self.db.execute_returning(
                 """
                 UPDATE lattice_peers
@@ -386,7 +385,7 @@ class PeerManager:
                 logger.info(f"Cleaned up {count} stale neighbors")
 
             # Also delete peers not seen in 90+ days (prevents unbounded table growth)
-            cutoff_time_90 = (utc_now() - timedelta(days=90)).isoformat()
+            cutoff_time_90 = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
             deleted = self.db.execute_returning(
                 """
                 DELETE FROM lattice_peers

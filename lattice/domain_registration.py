@@ -286,15 +286,16 @@ class DomainRegistrationService:
                 }
 
             # Insert new identity
+            from .secrets import get_private_key_path
             self.db.execute_insert(
                 """
-                INSERT INTO lattice_identity (id, server_id, server_uuid, private_key_vault_path, public_key, fingerprint)
-                VALUES (1, %(server_id)s, %(server_uuid)s, %(private_key_vault_path)s, %(public_key)s, %(fingerprint)s)
+                INSERT INTO lattice_identity (id, server_id, server_uuid, private_key_path, public_key, fingerprint)
+                VALUES (1, %(server_id)s, %(server_uuid)s, %(private_key_path)s, %(public_key)s, %(fingerprint)s)
                 """,
                 {
                     'server_id': domain,
                     'server_uuid': server_uuid,
-                    'private_key_vault_path': "lattice/keys/private_key",
+                    'private_key_path': str(get_private_key_path()),
                     'public_key': public_key,
                     'fingerprint': self.gossip_protocol.generate_fingerprint(public_key)
                 }

@@ -2,201 +2,116 @@
 
 This document describes how to set up the Lattice discovery daemon as a systemd service for production deployment.
 
-## Service File
+## Quick Start
 
-Create `/etc/systemd/system/lattice-discovery.service`:
-
-```ini
-[Unit]
-Description=Lattice Discovery Daemon
-Documentation=https://github.com/taylorsatula/lattice
-After=network.target vault.service
-Wants=vault.service
-
-[Service]
-Type=simple
-User=lattice
-Group=lattice
-WorkingDirectory=/opt/lattice
-
-# Environment variables
-Environment="PYTHONUNBUFFERED=1"
-Environment="VAULT_ADDR=http://localhost:8200"
-EnvironmentFile=/etc/lattice/lattice.env
-
-# Start discovery daemon on port 1113
-ExecStart=/opt/lattice/venv/bin/python -m uvicorn \
-    lattice.discovery_daemon:app \
-    --host 0.0.0.0 \
-    --port 1113 \
-    --log-level info
-
-# Restart policy
-Restart=always
-RestartSec=10
-StartLimitInterval=300
-StartLimitBurst=5
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/lattice/data
-ReadOnlyPaths=/opt/lattice
-
-# Resource limits
-LimitNOFILE=65536
-MemoryMax=512M
-CPUQuota=50%
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## Environment File
-
-Create `/etc/lattice/lattice.env`:
+The easiest way to deploy is using the deploy script:
 
 ```bash
-# Vault configuration (AppRole authentication)
-VAULT_ADDR=http://localhost:8200
-VAULT_ROLE_ID=your-role-id-here
-VAULT_SECRET_ID=your-secret-id-here
-
-# Optional: Vault namespace (for Vault Enterprise)
-# VAULT_NAMESPACE=lattice
+./deploy.sh
 ```
 
-**Security Note:** This file contains sensitive credentials. Protect it:
-```bash
-sudo chown root:lattice /etc/lattice/lattice.env
-sudo chmod 640 /etc/lattice/lattice.env
-```
+This handles secrets setup, identity generation, and systemd configuration automatically.
 
-## Installation Steps
+## Manual Setup
 
-### 1. Create Service User
+### Service File
+
+The service file is at `deploy/lattice.service`. For manual installation:
 
 ```bash
-# Create lattice system user if it doesn't exist
-sudo useradd --system --no-create-home --shell /bin/false lattice
-
-# Create necessary directories
-sudo mkdir -p /opt/lattice/data
-sudo chown -R lattice:lattice /opt/lattice/data
-```
-
-### 2. Install Service File
-
-```bash
-# Copy service file
-sudo cp /path/to/lattice-discovery.service /etc/systemd/system/
-
-# Reload systemd
+sudo cp deploy/lattice.service /etc/systemd/system/lattice.service
 sudo systemctl daemon-reload
 ```
 
-### 3. Configure Environment
+### Secrets Configuration
+
+Lattice uses file-based secrets at `/etc/lattice/`:
 
 ```bash
-# Create config directory
+# Create secrets directory
 sudo mkdir -p /etc/lattice
+sudo chmod 700 /etc/lattice
 
-# Create environment file with your credentials
-sudo nano /etc/lattice/lattice.env
-
-# Set permissions
-sudo chown root:lattice /etc/lattice/lattice.env
-sudo chmod 640 /etc/lattice/lattice.env
+# Create config file
+sudo tee /etc/lattice/config.env > /dev/null <<EOF
+APP_URL=https://your-server.com
+LATTICE_BOOTSTRAP_SERVERS=https://lattice.miraos.org
+EOF
+sudo chmod 600 /etc/lattice/config.env
 ```
 
-### 4. Enable and Start Service
+The private key is auto-generated on first run at `/etc/lattice/private_key.pem`.
+
+### systemd Credentials (systemd 250+)
+
+On modern systems, the deploy script automatically encrypts credentials:
 
 ```bash
-# Enable service to start on boot
-sudo systemctl enable lattice-discovery
-
-# Start service
-sudo systemctl start lattice-discovery
-
-# Check status
-sudo systemctl status lattice-discovery
+# Manual encryption (optional)
+sudo systemd-creds encrypt --name=private_key /etc/lattice/private_key.pem /etc/lattice/private_key.cred
+sudo systemd-creds encrypt --name=config /etc/lattice/config.env /etc/lattice/config.cred
 ```
+
+The service file uses `LoadCredentialEncrypted=` for encrypted credentials or `LoadCredential=` as fallback.
 
 ## Service Management
+
+### Enable and Start
+
+```bash
+sudo systemctl enable lattice
+sudo systemctl start lattice
+```
 
 ### View Logs
 
 ```bash
 # Follow logs in real-time
-sudo journalctl -u lattice-discovery -f
+sudo journalctl -u lattice -f
 
 # View last 100 lines
-sudo journalctl -u lattice-discovery -n 100
-
-# View logs since boot
-sudo journalctl -u lattice-discovery -b
+sudo journalctl -u lattice -n 100
 ```
 
 ### Control Service
 
 ```bash
-# Start service
-sudo systemctl start lattice-discovery
-
-# Stop service
-sudo systemctl stop lattice-discovery
-
-# Restart service
-sudo systemctl restart lattice-discovery
-
-# Reload configuration (if supported)
-sudo systemctl reload lattice-discovery
-
-# Check status
-sudo systemctl status lattice-discovery
+sudo systemctl start lattice
+sudo systemctl stop lattice
+sudo systemctl restart lattice
+sudo systemctl status lattice
 ```
 
-### Troubleshooting
+## Troubleshooting
 
-#### Service won't start
+### Service won't start
 
 ```bash
 # Check service status for errors
-sudo systemctl status lattice-discovery
+sudo systemctl status lattice
 
 # Check recent logs
-sudo journalctl -u lattice-discovery -n 50
+sudo journalctl -u lattice -n 50
 
-# Verify environment file
-sudo cat /etc/lattice/lattice.env
-
-# Test manually as lattice user
-sudo -u lattice /opt/lattice/venv/bin/python -m uvicorn lattice.discovery_daemon:app --port 1113
+# Test manually
+python -m uvicorn lattice.discovery_daemon:app --port 1113
 ```
 
-#### Can't connect to Vault
+### Port 1113 already in use
 
 ```bash
-# Verify Vault is running
-sudo systemctl status vault
-
-# Test Vault connection
-vault status
-
-# Check environment variables
-sudo systemctl show lattice-discovery | grep Environment
-```
-
-#### Port 1113 already in use
-
-```bash
-# Check what's using the port
 sudo lsof -i :1113
+```
 
-# Or use netstat
-sudo netstat -tlnp | grep 1113
+### Credentials not loading
+
+Verify files exist and have correct permissions:
+
+```bash
+ls -la /etc/lattice/
+# Should show:
+# -rw------- private_key.pem
+# -rw------- config.env
 ```
 
 ## Integration with Main Application
@@ -214,37 +129,30 @@ These are registered automatically when the application starts (see `lattice/ini
 ### Health Check
 
 ```bash
-# Check if daemon is responding
-curl http://localhost:1113/api/v1/peers
-
-# Expected: JSON list of peer servers
+curl http://localhost:1113/status
+curl http://localhost:1113/health  # localhost only
 ```
 
 ### Service Metrics
 
 ```bash
-# View service resource usage
-systemctl status lattice-discovery
-
-# Detailed resource stats
-systemctl show lattice-discovery --property=MemoryCurrent,CPUUsage
+systemctl status lattice
+systemctl show lattice --property=MemoryCurrent,CPUUsage
 ```
 
 ## Security Best Practices
 
-1. **Run as non-root user**: Service runs as `lattice` user with limited permissions
-2. **Protect credentials**: Environment file is only readable by `root` and `lattice` group
-3. **Filesystem restrictions**: Service has read-only access to application code
-4. **Network binding**: Only binds to localhost (use reverse proxy for external access)
+1. **Run as non-root user**: Service runs as dedicated `lattice` user
+2. **Protect credentials**: Secret files have 600 permissions
+3. **Use encrypted credentials**: On systemd 250+, credentials are encrypted at rest
+4. **Filesystem restrictions**: Service has limited write access via `ProtectSystem=strict`
 5. **Resource limits**: Memory and CPU limits prevent resource exhaustion
-6. **Restart policy**: Automatic restart on failure with backoff
 
 ## Reverse Proxy Configuration (Nginx)
 
-For external federation access, configure nginx:
+For external federation access:
 
 ```nginx
-# Federation discovery daemon (port 1113)
 location /discovery/ {
     proxy_pass http://localhost:1113/;
     proxy_http_version 1.1;
@@ -252,50 +160,5 @@ location /discovery/ {
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
-
-    # Timeout settings for long-polling if needed
-    proxy_connect_timeout 60s;
-    proxy_send_timeout 60s;
-    proxy_read_timeout 60s;
 }
-```
-
-Then reload nginx:
-```bash
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-## Upgrading
-
-When deploying new versions:
-
-```bash
-# Stop service
-sudo systemctl stop lattice-discovery
-
-# Update code
-cd /opt/lattice
-sudo -u lattice git pull
-
-# Restart service
-sudo systemctl start lattice-discovery
-
-# Verify
-sudo systemctl status lattice-discovery
-```
-
-## Uninstallation
-
-To remove the service:
-
-```bash
-# Stop and disable
-sudo systemctl stop lattice-discovery
-sudo systemctl disable lattice-discovery
-
-# Remove service file
-sudo rm /etc/systemd/system/lattice-discovery.service
-
-# Reload systemd
-sudo systemctl daemon-reload
 ```

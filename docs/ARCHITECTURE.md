@@ -112,7 +112,7 @@ def __init__(self):
 - **Rate limiting** - 100 messages/minute per peer (sliding window)
 - **Circuit breaker** - 5 failures → 15 minute timeout per peer
 - **Write-only delivery** - Federation can't read user data, only write messages
-- **Credentials in Vault** - Private keys stored in HashiCorp Vault
+- **Secure credential storage** - Private keys via systemd credentials (encrypted) or file-based with 600 permissions
 
 ---
 
@@ -128,11 +128,11 @@ def __init__(self):
 
 ## Production Deployment
 
-See `LATTICE_VAULT_SETUP.md` and `LATTICE_SYSTEMD.md` for setup instructions.
+See `LATTICE_SYSTEMD.md` for systemd setup instructions.
 
 **Required:**
 1. Database schema auto-created on startup (SQLite)
-2. Configure Vault secrets (APP_URL, private key)
+2. Configure secrets in `/etc/lattice/` (APP_URL in config.env, private key)
 3. Run discovery daemon (systemd service: `deploy/lattice.service`)
 4. Configure username resolver for message delivery to local users
 5. Main scheduler automatically handles periodic tasks

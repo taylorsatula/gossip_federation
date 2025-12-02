@@ -44,7 +44,7 @@ def _secure_delete(filepath: str) -> None:
                 os.unlink(filepath)
 
 
-from clients.vault_client import _ensure_vault_client, get_service_config
+from .secrets import load_config, save_private_key, get_private_key_path
 from .gossip_protocol import GossipProtocol
 from .domain_registration import DomainRegistrationService
 
@@ -82,35 +82,13 @@ def ensure_lattice_identity() -> Dict[str, Any]:
         private_pem, public_pem = gossip.generate_keypair()
         fingerprint = gossip.generate_fingerprint(public_pem)
 
-        # Store private key in Vault using CLI
-        vault_path = "lattice/keys"
+        # Store private key to disk
         try:
-            import tempfile
-
-            # Write private key to temp file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
-                f.write(private_pem)
-                temp_key_file = f.name
-
-            try:
-                # Use vault CLI to patch the secret
-                result = subprocess.run(
-                    ['vault', 'kv', 'patch', f'secret/{vault_path}', f'private_key={private_pem}'],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                logger.info(f"Stored private key in Vault at {vault_path}")
-            finally:
-                # Securely delete temp file by overwriting before removal
-                _secure_delete(temp_key_file)
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to store private key in Vault via CLI: {e.stderr}")
-            raise RuntimeError(f"Cannot initialize federation without Vault access: {e.stderr}")
+            key_path = save_private_key(private_pem)
+            logger.info(f"Stored private key at {key_path}")
         except Exception as e:
-            logger.error(f"Failed to store private key in Vault: {e}")
-            raise RuntimeError("Cannot initialize federation without Vault access")
+            logger.error(f"Failed to store private key: {e}")
+            raise RuntimeError(f"Cannot initialize federation without saving private key: {e}")
 
         # Get suggested domain from environment or generate
         suggested_domain = os.getenv("LATTICE_DOMAIN", "lattice-" + fingerprint[:8].lower())
@@ -123,14 +101,14 @@ def ensure_lattice_identity() -> Dict[str, Any]:
         db.execute_insert(
             """
             INSERT INTO lattice_identity
-            (id, server_id, server_uuid, private_key_vault_path, public_key, fingerprint,
+            (id, server_id, server_uuid, private_key_path, public_key, fingerprint,
              bootstrap_servers, created_at)
             VALUES (1, ?, ?, ?, ?, ?, ?, datetime('now'))
             """,
             (
                 suggested_domain,
                 server_uuid,
-                f"{vault_path}:private_key",
+                str(key_path),
                 public_pem,
                 fingerprint,
                 json.dumps([])  # Bootstrap servers can be added later
@@ -166,9 +144,9 @@ def initialize_lattice_services(scheduler_service) -> bool:
         # Ensure lattice identity exists
         identity_info = ensure_lattice_identity()
 
-        # Get federation configuration from Vault
+        # Get federation configuration
         try:
-            bootstrap_servers = get_service_config("lattice", "LATTICE_BOOTSTRAP_SERVERS")
+            bootstrap_servers = load_config("BOOTSTRAP_SERVERS")
             if bootstrap_servers:
                 # Parse comma-separated list
                 bootstrap_list = [s.strip() for s in bootstrap_servers.split(",")]
@@ -178,7 +156,7 @@ def initialize_lattice_services(scheduler_service) -> bool:
                     "UPDATE lattice_identity SET bootstrap_servers = ? WHERE id = 1",
                     (json_module.dumps(bootstrap_list),)
                 )
-                logger.info(f"Configured {len(bootstrap_list)} bootstrap servers from Vault")
+                logger.info(f"Configured {len(bootstrap_list)} bootstrap servers")
         except Exception as e:
             logger.warning(f"No bootstrap servers configured: {e}")
 

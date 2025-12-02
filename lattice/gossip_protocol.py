@@ -8,7 +8,8 @@ import base64
 import hashlib
 import json
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from dateutil import parser as dateutil_parser
 from typing import Dict, Any, Optional, Tuple
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -17,7 +18,6 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 
 from .sqlite_client import SQLiteClient
-from utils.timezone_utils import utc_now, parse_utc_time_string
 from .models import (
     ServerAnnouncement,
     PeerExchange,
@@ -47,28 +47,26 @@ class GossipProtocol:
         self.peer_manager = PeerManager()
 
     def _load_identity(self) -> None:
-        """Load server identity from database and Vault."""
+        """Load server identity from database and secrets."""
         try:
             identity = self.db.execute_single(
-                "SELECT server_id, server_uuid, private_key_vault_path, public_key FROM lattice_identity WHERE id = 1"
+                "SELECT server_id, server_uuid, private_key_path, public_key FROM lattice_identity WHERE id = 1"
             )
 
             if identity:
                 self._server_id = identity['server_id']
                 self._server_uuid = identity['server_uuid']
 
-                # Load private key from Vault
-                from clients.vault_client import _ensure_vault_client
-                vault = _ensure_vault_client()
-                vault_path, field_name = identity['private_key_vault_path'].split(':', 1) if ':' in identity['private_key_vault_path'] else (identity['private_key_vault_path'], 'private_key')
-                private_key_pem = vault.get_secret(vault_path, field_name)
+                # Load private key using secrets fallback chain
+                from .secrets import load_private_key
+                private_key_pem = load_private_key()
 
                 # Validate that key was retrieved
                 if not private_key_pem:
-                    raise RuntimeError(f"Private key not found in Vault at {vault_path}:{field_name}")
+                    raise RuntimeError("Private key not found")
 
                 if len(private_key_pem.strip()) < 100:  # Sanity check for valid PEM
-                    raise RuntimeError(f"Invalid private key in Vault (too short): {len(private_key_pem)} chars")
+                    raise RuntimeError(f"Invalid private key (too short): {len(private_key_pem)} chars")
 
                 self._private_key = serialization.load_pem_private_key(
                     private_key_pem.encode(),
@@ -86,10 +84,10 @@ class GossipProtocol:
                         ),
                         hashes.SHA256()
                     )
-                    logger.info(f"Federation private key validated successfully")
+                    logger.info("Federation private key validated successfully")
                 except Exception as e:
                     logger.error(f"Private key validation failed: {e}")
-                    raise RuntimeError(f"Cannot use private key from Vault: {e}")
+                    raise RuntimeError(f"Cannot use private key: {e}")
 
                 # Load public key from database
                 self._public_key = serialization.load_pem_public_key(
@@ -220,12 +218,12 @@ class GossipProtocol:
             return None
 
         try:
-            from clients.vault_client import get_service_config
+            from .secrets import load_config
 
-            # Get APP_URL from Vault
-            app_url = get_service_config("lattice", "APP_URL")
+            # Get APP_URL from config
+            app_url = load_config("APP_URL")
             if not app_url:
-                logger.error("No APP_URL configured in Vault")
+                logger.error("No APP_URL configured")
                 return None
 
             # Create announcement
@@ -293,8 +291,10 @@ class GossipProtocol:
 
                 # Validate timestamp to prevent replay attacks
                 try:
-                    announcement_time = parse_utc_time_string(announcement.timestamp)
-                    age = utc_now() - announcement_time
+                    announcement_time = dateutil_parser.parse(announcement.timestamp)
+                    if announcement_time.tzinfo is None:
+                        announcement_time = announcement_time.replace(tzinfo=timezone.utc)
+                    age = datetime.now(timezone.utc) - announcement_time
 
                     if age > timedelta(hours=1):
                         logger.warning(f"Stale announcement from {announcement.server_id} (age: {age})")
@@ -422,7 +422,7 @@ class GossipProtocol:
 
             # Cache the route (use INSERT OR REPLACE for SQLite upsert)
             import uuid as uuid_module
-            expires_at = (utc_now() + timedelta(hours=24)).isoformat()
+            expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
             self.db.execute_insert(
                 """
                 INSERT OR REPLACE INTO lattice_routes
@@ -522,14 +522,14 @@ class GossipProtocol:
         """
         Rotate this server's keypair (full automation).
 
-        Generates new key, updates Vault and DB, gossips to network.
+        Generates new key, updates storage and DB, gossips to network.
         """
         if not self._server_uuid:
             logger.error("Cannot rotate key without server identity")
             return False
 
         try:
-            from clients.vault_client import _ensure_vault_client
+            from .secrets import save_private_key
 
             # Generate new keypair
             new_private_pem, new_public_pem = self.generate_keypair()
@@ -539,13 +539,8 @@ class GossipProtocol:
             if not rotation:
                 return False
 
-            # Store new private key in Vault
-            vault = _ensure_vault_client()
-            identity = self.db.execute_single(
-                "SELECT private_key_vault_path FROM lattice_identity WHERE id = 1"
-            )
-            vault_path, field_name = identity['private_key_vault_path'].split(':', 1)
-            vault.write_secret(vault_path, {field_name: new_private_pem})
+            # Store new private key to disk
+            save_private_key(new_private_pem)
 
             # Update database
             self.db.execute_update(

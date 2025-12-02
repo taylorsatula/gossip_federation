@@ -1,8 +1,7 @@
 [Unit]
 Description=Lattice Discovery Service
 Documentation=https://github.com/taylorsatula/lattice
-After=network.target vault.service
-Wants=vault.service
+After=network.target
 
 [Service]
 Type=simple
@@ -11,6 +10,11 @@ Group=lattice
 WorkingDirectory=/opt/lattice
 Environment="PATH=/opt/lattice/venv/bin:/usr/local/bin:/usr/bin"
 Environment="PYTHONUNBUFFERED=1"
+
+# Load secrets via systemd credentials (systemd 250+)
+# Falls back to /etc/lattice/ files if credentials not available
+LoadCredential=private_key:/etc/lattice/private_key.pem
+LoadCredential=config:/etc/lattice/config.env
 
 # Lattice discovery daemon runs on port 1113
 ExecStart=/opt/lattice/venv/bin/python -m uvicorn lattice.discovery_daemon:app \

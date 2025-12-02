@@ -341,8 +341,8 @@ A new server `new-branch` wants to join the federation:
 1. BOOTSTRAP
    ┌─────────────────┐                    ┌─────────────────┐
    │   new-branch    │  GET /api/v1/      │ bootstrap-server│
-   │                 │  announcement      │  (configured    │
-   │  "I'm new here" │ ──────────────────▶│   in Vault)     │
+   │                 │  announcement      │  (configured in │
+   │  "I'm new here" │ ──────────────────▶│   config.env)   │
    │                 │                    │                 │
    │                 │ ◀────────────────  │  "Here's my     │
    │                 │  ServerAnnouncement│   identity"     │
@@ -400,7 +400,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for confidence calculation deta
 | Component | Details |
 |-----------|---------|
 | **Cryptography** | RSA-2048 keypairs, RSA-PSS with SHA-256 signatures |
-| **Key Storage** | HashiCorp Vault |
+| **Key Storage** | systemd credentials (encrypted) or file-based (/etc/lattice/) |
 | **Message Signing** | All protocol messages cryptographically signed |
 | **Rate Limiting** | Per-peer limits prevent spam and abuse |
 | **Circuit Breaker** | Automatic backoff from unresponsive peers |
@@ -444,7 +444,6 @@ uvicorn lattice.discovery_daemon:app --reload --port 1113
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for database schema, scheduled tasks, and internals.
 See [docs/LATTICE_SYSTEMD.md](docs/LATTICE_SYSTEMD.md) for systemd service setup.
-See [docs/LATTICE_VAULT_SETUP.md](docs/LATTICE_VAULT_SETUP.md) for Vault configuration.
 
 ---
 

@@ -8,12 +8,11 @@ All messages are cryptographically signed for authenticity.
 import ipaddress
 import socket
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Literal, Any
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
-from utils.timezone_utils import utc_now
 
 
 # =====================================================================
@@ -128,7 +127,7 @@ class ServerAnnouncement(BaseModel):
     public_key: str = Field(description="RSA public key in PEM format")
     capabilities: ServerCapabilities = Field(default_factory=ServerCapabilities)
     endpoints: ServerEndpoints = Field(description="Service endpoint URLs")
-    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     signature: str = Field(description="Base64 signature of message content")
 
     @field_validator('server_id')
@@ -153,7 +152,7 @@ class FederatedMessage(BaseModel):
     to_address: str = Field(description="Recipient address (e.g., alex@remote.otherserver.com)")
     content: str = Field(max_length=10000, description="Message content (max 10KB)")
     priority: int = Field(default=0, ge=0, le=2, description="0=normal, 1=high, 2=urgent")
-    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     sender_fingerprint: str = Field(description="Sender's device fingerprint")
     signature: str = Field(description="Base64 signature of message")
 
@@ -184,7 +183,7 @@ class MessageAcknowledgment(BaseModel):
     message_id: str = Field(description="ID of the message being acknowledged")
     status: Literal["delivered", "failed", "rejected"] = Field(description="Delivery status")
     recipient_server: str = Field(description="Server that received the message")
-    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     signature: str = Field(description="Base64 signature")
 
     # Optional error info
@@ -202,7 +201,7 @@ class DomainQuery(BaseModel):
     domain: str = Field(description="Domain to resolve (e.g., other-server.com)")
     requester: str = Field(description="Server making the query")
     max_hops: int = Field(default=5, ge=1, le=10, description="Maximum hops for query (limited to prevent amplification)")
-    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     @field_validator('domain')
     @classmethod
@@ -222,7 +221,7 @@ class DomainResponse(BaseModel):
     endpoint_url: Optional[str] = Field(default=None, description="Federation endpoint URL")
     hop_count: int = Field(description="Number of hops to find result")
     confidence: float = Field(default=0.9, ge=0.0, le=1.0)
-    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 # =====================================================================
@@ -234,7 +233,7 @@ class PeerExchange(BaseModel):
     version: str = Field(default="1.0")
     from_server: str = Field(description="Server sending the peer list")
     peers: List[str] = Field(description="List of known peer server IDs")
-    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     signature: str = Field(description="Signature of peer list")
 
 
@@ -245,7 +244,7 @@ class KeyRotation(BaseModel):
     old_public_key: str = Field(description="Current public key being rotated out")
     new_public_key: str = Field(description="New public key to use")
     reason: Literal["scheduled", "compromise_suspected", "upgrade"] = Field(default="scheduled")
-    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     signature: str = Field(description="Signature using OLD private key")
 
 
@@ -255,7 +254,7 @@ class IdentityRevocation(BaseModel):
     server_uuid: str = Field(description="UUID being permanently revoked")
     server_id: str = Field(description="Current server_id for logging")
     reason: str = Field(description="Revocation reason")
-    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     signature: str = Field(description="Signature using server's private key")
 
 
@@ -264,7 +263,7 @@ class GossipMessage(BaseModel):
     message_type: Literal["announcement", "peer_exchange", "domain_query", "domain_response", "key_rotation", "identity_revocation"]
     payload: Dict[str, Any] = Field(description="Message payload")
     from_server: str = Field(description="Server sending the gossip")
-    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 # =====================================================================
@@ -303,6 +302,6 @@ class QueuedMessage(BaseModel):
     destination_server: Optional[str] = Field(default=None)
     attempt_count: int = Field(default=0)
     next_attempt_at: Optional[datetime] = Field(default=None)
-    created_at: datetime = Field(default_factory=utc_now)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime
     last_error: Optional[str] = Field(default=None)

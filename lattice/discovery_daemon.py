@@ -11,7 +11,7 @@ import logging
 import random
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 
@@ -19,7 +19,6 @@ from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 
 from .sqlite_client import SQLiteClient
-from utils.timezone_utils import utc_now
 from .models import (
     ServerAnnouncement,
     DomainQuery,
@@ -131,7 +130,7 @@ class DiscoveryService:
         self.bootstrap_servers: List[str] = []
 
         # Status tracking for /status and /health endpoints
-        self.start_time = utc_now()
+        self.start_time = datetime.now(timezone.utc)
         self.maintenance_mode = False
         self.cached_saturation: float = 0.0
 
@@ -222,7 +221,7 @@ class DiscoveryService:
                 except Exception as e:
                     logger.error(f"Failed to gossip to {neighbor['server_id']}: {e}")
 
-            self.last_gossip_time = utc_now()
+            self.last_gossip_time = datetime.now(timezone.utc)
             logger.info(f"Completed gossip round to {gossip_count} neighbors")
 
             # Update saturation metric after gossip
@@ -402,7 +401,7 @@ class DiscoveryService:
             Number of stale query IDs removed
         """
         try:
-            cutoff = utc_now() - timedelta(minutes=5)
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
             before_count = len(self._processed_queries)
 
             self._processed_queries = OrderedDict(
@@ -497,7 +496,7 @@ class DiscoveryService:
         if not peer or not peer['circuit_open_until']:
             return True
 
-        if peer['circuit_open_until'] <= utc_now():
+        if peer['circuit_open_until'] <= datetime.now(timezone.utc):
             # Timeout expired - reset circuit
             self.db.execute_update(
                 "UPDATE lattice_peers SET circuit_failures = 0, circuit_open_until = NULL WHERE server_id = %s",
@@ -529,7 +528,7 @@ class DiscoveryService:
         )
 
         if result and result[0]['circuit_failures'] >= self._circuit_breaker_threshold:
-            open_until = utc_now() + self._circuit_breaker_timeout
+            open_until = datetime.now(timezone.utc) + self._circuit_breaker_timeout
             self.db.execute_update(
                 "UPDATE lattice_peers SET circuit_open_until = %s WHERE server_id = %s",
                 (open_until, server_id)
@@ -674,7 +673,7 @@ class DiscoveryService:
         else:
             # Schedule retry with exponential backoff (capped at 60 minutes)
             backoff_minutes = min(2 ** attempt_count, 60)  # 2, 4, 8, 16, 32, 60 minutes max
-            next_attempt = utc_now() + timedelta(minutes=backoff_minutes)
+            next_attempt = datetime.now(timezone.utc) + timedelta(minutes=backoff_minutes)
 
             self.db.execute_update(
                 """
@@ -820,7 +819,7 @@ async def health_check(_: str = Depends(localhost_only)):
         )
 
         # Calculate uptime
-        uptime_seconds = int((utc_now() - discovery_service.start_time).total_seconds())
+        uptime_seconds = int((datetime.now(timezone.utc) - discovery_service.start_time).total_seconds())
 
         return {
             "status": "healthy",
@@ -903,7 +902,7 @@ async def announce_server(request: AnnouncementRequest, background_tasks: Backgr
     try:
         # Check if we recently announced
         if not request.force and discovery_service.last_gossip_time:
-            time_since = (utc_now() - discovery_service.last_gossip_time).total_seconds()
+            time_since = (datetime.now(timezone.utc) - discovery_service.last_gossip_time).total_seconds()
             if time_since < 60:
                 return {
                     "status": "rate_limited",
@@ -942,7 +941,7 @@ async def list_peers(
 
         if active_only:
             query += " AND last_seen_at > %s"
-            params.append(utc_now() - timedelta(days=7))
+            params.append(datetime.now(timezone.utc) - timedelta(days=7))
 
         if not include_blocked:
             query += " AND trust_status != 'blocked'"
@@ -985,7 +984,7 @@ async def handle_domain_query(query: DomainQuery) -> DomainResponse:
         if len(discovery_service._processed_queries) >= discovery_service._max_query_cache_size:
             # Evict oldest entry (FIFO, which approximates LRU for this use case)
             discovery_service._processed_queries.popitem(last=False)
-        discovery_service._processed_queries[query.query_id] = utc_now()
+        discovery_service._processed_queries[query.query_id] = datetime.now(timezone.utc)
 
         # Process the query using gossip protocol
         response = discovery_service.gossip_protocol._handle_domain_query(
@@ -1071,7 +1070,7 @@ async def resolve_route(domain: str) -> RouteQueryResponse:
             )
 
         # Not in cache - initiate discovery query to neighbors
-        query_id = f"QUERY-{int(utc_now().timestamp() * 1000)}"
+        query_id = f"QUERY-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
         query = DomainQuery(
             query_id=query_id,
             domain=domain,
@@ -1340,7 +1339,7 @@ async def register_domain(request: DomainRegistrationRequest):
 #   4. Create valid announcements with proper signatures
 #
 # CURRENT ALTERNATIVES:
-# - Bootstrap servers (configured in Vault: FEDERATION_BOOTSTRAP_SERVERS)
+# - Bootstrap servers (configured in /etc/lattice/config.env: LATTICE_BOOTSTRAP_SERVERS)
 # - Gossip protocol (peers share neighbor lists automatically)
 #
 # TO RE-IMPLEMENT:
