@@ -8,6 +8,7 @@ Provides REST API for local tools to query routes.
 import asyncio
 import ipaddress
 import logging
+import os
 import random
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -24,8 +25,11 @@ from .models import (
     DomainQuery,
     DomainResponse,
     GossipMessage,
-    PeerExchangeFile
+    PeerExchangeFile,
+    FederatedMessage,
+    MessageAcknowledgment
 )
+from .username_resolver import resolve_username, has_username_resolver
 from .peer_manager import PeerManager
 from .gossip_protocol import GossipProtocol
 from .domain_registration import (
@@ -70,6 +74,13 @@ class PeerStatus(BaseModel):
     trust_status: str
     last_seen: str
     endpoints: Dict[str, str]
+
+
+class InboundMessageResponse(BaseModel):
+    """Response for inbound federated message."""
+    status: str = Field(description="accepted, rejected, or failed")
+    message_id: str = Field(description="ID of the processed message")
+    ack: Optional[Dict[str, Any]] = Field(default=None, description="Signed acknowledgment")
 
 
 # =====================================================================
@@ -1159,15 +1170,10 @@ async def resolve_route(domain: str) -> RouteQueryResponse:
 async def receive_gossip(message: GossipMessage):
     """Receive gossip message from another server."""
     try:
-        # Get sender's existing peer record
-        sender = discovery_service.db.execute_single(
-            "SELECT public_key, server_uuid FROM lattice_peers WHERE server_id = %s",
-            (message.from_server,)
-        )
-
-        # Rate limiting: 100 gossip messages per minute per peer
-        if sender:
-            rate_check = discovery_service.db.execute_returning(
+        # FASTPATH: Single atomic query for known peers - rate limit + peer info
+        # Unknown peers (bootstrap announcements) handled separately below
+        try:
+            sender = discovery_service.db.execute_single(
                 """
                 UPDATE lattice_peers
                 SET query_count = CASE
@@ -1181,13 +1187,19 @@ async def receive_gossip(message: GossipMessage):
                         ELSE rate_limit_reset_at
                     END
                 WHERE server_id = %s
-                RETURNING query_count
+                RETURNING public_key, server_uuid, query_count
                 """,
                 (message.from_server,)
             )
-            if rate_check and len(rate_check) > 0 and rate_check[0]['query_count'] > 100:
-                logger.warning(f"Rate limit exceeded for gossip from {message.from_server}")
-                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        except Exception as e:
+            # FAIL CLOSED: Database error rejects the request
+            logger.error(f"Rate limit check failed for gossip from {message.from_server}: {e}")
+            raise HTTPException(status_code=503, detail="Rate limit check unavailable")
+
+        # FASTPATH EXIT: Check rate limit immediately for known peers
+        if sender and sender['query_count'] > 100:
+            logger.warning(f"Rate limit exceeded for gossip from {message.from_server} (count: {sender['query_count']})")
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
         # For announcements, verify public key authenticity
         if message.message_type == "announcement":
@@ -1262,6 +1274,229 @@ async def receive_gossip(message: GossipMessage):
     except Exception as e:
         logger.error(f"Error receiving gossip: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/federation/messages/receive")
+async def receive_federated_message(message: FederatedMessage) -> InboundMessageResponse:
+    """
+    Receive an inbound federated message from a remote Lattice node.
+
+    This endpoint:
+    1. Verifies the message signature using the sender's public key
+    2. Checks rate limits for the sending server
+    3. Checks for duplicate message_id (idempotency)
+    4. Resolves the recipient username to a user_id via the username_resolver hook
+    5. Delivers the message via webhook to the configured LATTICE_DELIVERY_WEBHOOK
+    6. Returns a signed acknowledgment to the sender
+    """
+    import httpx
+
+    try:
+        # Extract sender domain from from_address
+        if '@' not in message.from_address:
+            raise HTTPException(status_code=400, detail="Invalid from_address format")
+
+        _, sender_domain = message.from_address.split('@', 1)
+
+        # FASTPATH: Single atomic query that:
+        # 1. Updates rate limit counter
+        # 2. Returns peer info + current count
+        # 3. Fails closed on any error
+        try:
+            sender = discovery_service.db.execute_single(
+                """
+                UPDATE lattice_peers
+                SET query_count = CASE
+                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < datetime('now')
+                        THEN 1
+                        ELSE query_count + 1
+                    END,
+                    rate_limit_reset_at = CASE
+                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < datetime('now')
+                        THEN datetime('now', '+1 minute')
+                        ELSE rate_limit_reset_at
+                    END
+                WHERE server_id = %s
+                RETURNING server_id, public_key, trust_status, query_count
+                """,
+                (sender_domain,)
+            )
+        except Exception as e:
+            # FAIL CLOSED: Any database error rejects the request
+            logger.error(f"Rate limit check failed for {sender_domain}: {e}")
+            raise HTTPException(status_code=503, detail="Rate limit check unavailable")
+
+        # FAIL CLOSED: No result means unknown peer OR database issue
+        if not sender:
+            logger.warning(f"Received message from unknown server: {sender_domain}")
+            raise HTTPException(status_code=403, detail=f"Unknown sender server: {sender_domain}")
+
+        # FASTPATH EXIT: Check rate limit immediately after atomic update
+        if sender['query_count'] > 100:
+            logger.warning(f"Rate limit exceeded for messages from {sender_domain} (count: {sender['query_count']})")
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+        # Now safe to do more expensive checks
+        if sender['trust_status'] == 'blocked':
+            logger.warning(f"Rejecting message from blocked server: {sender_domain}")
+            raise HTTPException(status_code=403, detail="Sender server is blocked")
+
+        # Verify message signature
+        message_dict = message.model_dump(exclude={'signature'})
+        if not discovery_service.gossip_protocol.verify_signature(
+            message_dict,
+            message.signature,
+            sender['public_key']
+        ):
+            logger.error(f"Invalid signature on message {message.message_id} from {sender_domain}")
+            raise HTTPException(status_code=403, detail="Message signature verification failed")
+
+        # Check for duplicate message (idempotency)
+        existing = discovery_service.db.execute_single(
+            "SELECT message_id FROM lattice_received_messages WHERE message_id = %s",
+            (message.message_id,)
+        )
+
+        if existing:
+            logger.info(f"Duplicate message {message.message_id} - already processed")
+            # Return success for idempotency (don't re-process, but acknowledge)
+            return InboundMessageResponse(
+                status="accepted",
+                message_id=message.message_id,
+                ack=None  # No new ack for duplicates
+            )
+
+        # Record the message as received
+        discovery_service.db.execute_insert(
+            """
+            INSERT INTO lattice_received_messages (message_id, from_address, received_at)
+            VALUES (%s, %s, datetime('now'))
+            """,
+            (message.message_id, message.from_address)
+        )
+
+        # Extract recipient username and resolve to user_id
+        if '@' not in message.to_address:
+            raise HTTPException(status_code=400, detail="Invalid to_address format")
+
+        recipient_username, _ = message.to_address.split('@', 1)
+
+        # Check if username resolver is configured
+        if not has_username_resolver():
+            logger.error("No username resolver configured - cannot deliver federated messages")
+            raise HTTPException(
+                status_code=503,
+                detail="Server not configured to receive federated messages"
+            )
+
+        # Resolve username to user_id
+        user_id = resolve_username(recipient_username)
+        if not user_id:
+            logger.warning(f"Unknown recipient username: {recipient_username}")
+            return InboundMessageResponse(
+                status="rejected",
+                message_id=message.message_id,
+                ack=_create_rejection_ack(message.message_id, f"Unknown recipient: {recipient_username}")
+            )
+
+        # Deliver via webhook
+        delivery_webhook = os.getenv("LATTICE_DELIVERY_WEBHOOK")
+        if not delivery_webhook:
+            logger.error("LATTICE_DELIVERY_WEBHOOK not configured")
+            raise HTTPException(
+                status_code=503,
+                detail="Delivery webhook not configured"
+            )
+
+        webhook_payload = {
+            "from_address": message.from_address,
+            "to_user_id": user_id,
+            "content": message.content,
+            "priority": message.priority,
+            "message_id": message.message_id,
+            "metadata": message.metadata,
+            "sender_verified": True,
+            "sender_server_id": sender_domain
+        }
+
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(delivery_webhook, json=webhook_payload)
+
+                if response.status_code == 200:
+                    logger.info(f"Message {message.message_id} delivered via webhook")
+
+                    # Create signed acknowledgment
+                    ack = _create_success_ack(message.message_id)
+
+                    return InboundMessageResponse(
+                        status="accepted",
+                        message_id=message.message_id,
+                        ack=ack
+                    )
+                elif 400 <= response.status_code < 500:
+                    # 4xx: Permanent rejection - bad message, don't retry
+                    logger.warning(f"Webhook rejected message {message.message_id}: {response.status_code} - {response.text}")
+                    return InboundMessageResponse(
+                        status="rejected",
+                        message_id=message.message_id,
+                        ack=_create_rejection_ack(message.message_id, f"Delivery rejected: {response.status_code}")
+                    )
+                else:
+                    # 5xx: Temporary failure - sender should retry
+                    logger.error(f"Webhook server error for {message.message_id}: {response.status_code} - {response.text}")
+                    raise HTTPException(status_code=502, detail=f"Delivery backend error: {response.status_code}")
+
+        except httpx.TimeoutException:
+            logger.error(f"Webhook timeout for message {message.message_id}")
+            raise HTTPException(status_code=504, detail="Delivery webhook timeout")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error receiving federated message: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _create_success_ack(message_id: str) -> Dict[str, Any]:
+    """Create a signed acknowledgment for successful delivery."""
+    server_id = discovery_service.gossip_protocol.get_server_id() or "unknown"
+
+    ack = MessageAcknowledgment(
+        ack_type="message_received",
+        message_id=message_id,
+        status="delivered",
+        recipient_server=server_id,
+        signature=""  # Placeholder
+    )
+
+    # Sign the acknowledgment
+    ack_dict = ack.model_dump(exclude={'signature'})
+    signature = discovery_service.gossip_protocol.sign_message(ack_dict)
+
+    ack_dict['signature'] = signature
+    return ack_dict
+
+
+def _create_rejection_ack(message_id: str, reason: str) -> Dict[str, Any]:
+    """Create a signed acknowledgment for rejected/failed delivery."""
+    server_id = discovery_service.gossip_protocol.get_server_id() or "unknown"
+
+    ack = MessageAcknowledgment(
+        ack_type="message_failed",
+        message_id=message_id,
+        status="rejected",
+        recipient_server=server_id,
+        error_message=reason,
+        signature=""  # Placeholder
+    )
+
+    # Sign the acknowledgment
+    ack_dict = ack.model_dump(exclude={'signature'})
+    signature = discovery_service.gossip_protocol.sign_message(ack_dict)
+
+    ack_dict['signature'] = signature
+    return ack_dict
 
 
 @app.post("/api/v1/domain/verify")

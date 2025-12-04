@@ -11,6 +11,10 @@ WorkingDirectory=/opt/lattice
 Environment="PATH=/opt/lattice/venv/bin:/usr/local/bin:/usr/bin"
 Environment="PYTHONUNBUFFERED=1"
 
+# Webhook for delivering inbound federated messages to MIRA
+# Override in /etc/lattice/config.env if MIRA runs on different host/port
+Environment="LATTICE_DELIVERY_WEBHOOK=http://localhost:8000/v0/api/federation/deliver"
+
 # Load secrets via systemd credentials (systemd 250+)
 # Falls back to /etc/lattice/ files if credentials not available
 LoadCredential=private_key:/etc/lattice/private_key.pem
