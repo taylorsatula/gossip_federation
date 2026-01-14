@@ -1,8 +1,5 @@
 """
-Client interface for communicating with Lattice service.
-
-This module provides a clean API to interact with the Lattice
-service without direct imports.
+HTTP client for the Lattice federation service.
 """
 
 import logging
@@ -27,11 +24,7 @@ class FederatedMessage(BaseModel):
 
 
 class LatticeClient:
-    """
-    Client for interacting with Lattice service.
-
-    HTTP client for interacting with Lattice service.
-    """
+    """HTTP client for sending federated messages and querying Lattice status."""
 
     def __init__(self, base_url: str = "http://localhost:1113", timeout: int = 30):
         """
@@ -106,9 +99,7 @@ class LatticeClient:
         self.client.close()
 
     def __enter__(self):
-        """Context manager entry."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
         self.close()

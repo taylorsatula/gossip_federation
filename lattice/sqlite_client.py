@@ -1,5 +1,5 @@
 """
-SQLite database client for Lattice.
+SQLite database client with PostgreSQL-style parameter conversion.
 """
 
 import json
