@@ -83,6 +83,23 @@ class InboundMessageResponse(BaseModel):
     ack: Optional[Dict[str, Any]] = Field(default=None, description="Signed acknowledgment")
 
 
+class SendMessageRequest(BaseModel):
+    """Request to send a federated message."""
+    to_address: str = Field(description="Recipient address (e.g., alex@remote.otherserver.com)")
+    from_address: str = Field(description="Sender address (e.g., taylor@local.ourserver.com)")
+    content: str = Field(max_length=10000, description="Message content (max 10KB)")
+    message_type: str = Field(default="pager", description="Message type: pager, location, ai_to_ai")
+    priority: int = Field(default=0, ge=0, le=2, description="0=normal, 1=high, 2=urgent")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+
+class SendMessageResponse(BaseModel):
+    """Response from send message endpoint."""
+    status: str = Field(description="queued, failed")
+    message_id: str = Field(description="ID of the queued message")
+    immediate_delivery: bool = Field(default=True, description="Whether immediate delivery was attempted")
+
+
 # =====================================================================
 # Access Control
 # =====================================================================
@@ -729,6 +746,154 @@ class DiscoveryService:
         )
 
         logger.error(f"Message {message_id} permanently failed: {error}")
+
+    # =====================================================================
+    # Outbound Message Queueing
+    # =====================================================================
+
+    def queue_outbound_message(
+        self,
+        to_address: str,
+        from_address: str,
+        content: str,
+        message_type: str = "pager",
+        priority: int = 0,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Sign and queue a message for delivery.
+
+        Args:
+            to_address: Recipient address (user@domain)
+            from_address: Sender address (user@domain)
+            content: Message content
+            message_type: Type of message (pager, location, ai_to_ai)
+            priority: Message priority (0=normal, 1=high, 2=urgent)
+            metadata: Optional metadata dict
+
+        Returns:
+            message_id of the queued message
+
+        Raises:
+            ValueError: If addresses are invalid or signing fails
+        """
+        import uuid
+
+        # Validate address formats
+        if '@' not in to_address:
+            raise ValueError(f"Invalid to_address format: {to_address}")
+        if '@' not in from_address:
+            raise ValueError(f"Invalid from_address format: {from_address}")
+
+        # Extract destination domain
+        _, to_domain = to_address.split('@', 1)
+
+        # Generate message ID
+        message_id = str(uuid.uuid4())
+
+        # Get sender fingerprint from our identity
+        identity = self.db.execute_single(
+            "SELECT fingerprint FROM lattice_identity WHERE id = 1"
+        )
+        if not identity:
+            raise ValueError("No federation identity configured")
+
+        sender_fingerprint = identity['fingerprint']
+
+        # Create message dict for signing (excluding signature field)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        message_dict = {
+            "version": "1.0",
+            "message_id": message_id,
+            "message_type": message_type,
+            "from_address": from_address.lower(),
+            "to_address": to_address.lower(),
+            "content": content,
+            "priority": priority,
+            "timestamp": timestamp,
+            "sender_fingerprint": sender_fingerprint,
+            "location": None,
+            "metadata": metadata or {}
+        }
+
+        # Sign the message
+        signature = self.gossip_protocol.sign_message(message_dict)
+
+        # Calculate expiry (24 hours)
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+
+        # Insert into queue
+        import json
+        self.db.execute_insert(
+            """
+            INSERT INTO lattice_messages (
+                id, message_id, from_address, to_address, to_domain,
+                message_type, content, priority, metadata,
+                signature, sender_fingerprint,
+                status, attempt_count, max_attempts, next_attempt_at,
+                created_at, expires_at
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s,
+                'pending', 0, 5, datetime('now'),
+                datetime('now'), %s
+            )
+            """,
+            (
+                str(uuid.uuid4()),  # id (row ID)
+                message_id,
+                from_address.lower(),
+                to_address.lower(),
+                to_domain.lower(),
+                message_type,
+                content,
+                priority,
+                json.dumps(metadata or {}),
+                signature,
+                sender_fingerprint,
+                expires_at
+            )
+        )
+
+        logger.info(f"Queued message {message_id} to {to_address}")
+        return message_id
+
+    async def deliver_message_async(self, message_id: str) -> None:
+        """
+        Deliver a single message immediately (runs in background).
+
+        This method fetches the message from the queue and attempts delivery.
+        On failure, it schedules retry with exponential backoff.
+
+        Args:
+            message_id: ID of the message to deliver
+        """
+        try:
+            # Fetch message from queue
+            msg = self.db.execute_single(
+                "SELECT * FROM lattice_messages WHERE message_id = %s",
+                (message_id,)
+            )
+
+            if not msg:
+                logger.warning(f"Message {message_id} not found for immediate delivery")
+                return
+
+            if msg['status'] != 'pending':
+                logger.debug(f"Message {message_id} already in status {msg['status']}, skipping")
+                return
+
+            # Attempt delivery using existing synchronous method
+            try:
+                self._deliver_single_message(msg)
+                logger.info(f"Immediate delivery succeeded for message {message_id}")
+            except Exception as e:
+                logger.warning(f"Immediate delivery failed for {message_id}: {e}")
+                self._handle_delivery_failure(msg, str(e))
+
+        except Exception as e:
+            logger.error(f"Error in deliver_message_async for {message_id}: {e}", exc_info=True)
 
 
 # =====================================================================
@@ -1497,6 +1662,54 @@ def _create_rejection_ack(message_id: str, reason: str) -> Dict[str, Any]:
 
     ack_dict['signature'] = signature
     return ack_dict
+
+
+@app.post("/api/v1/messages/send")
+async def send_federated_message(
+    request: SendMessageRequest,
+    background_tasks: BackgroundTasks,
+    _: str = Depends(localhost_only)
+) -> SendMessageResponse:
+    """
+    Queue and immediately attempt delivery of a federated message.
+
+    This endpoint is localhost-only, intended to be called by local applications
+    that want to send messages to users on remote Lattice servers.
+
+    The message is:
+    1. Signed with this server's private key
+    2. Inserted into the message queue
+    3. Immediately attempted for delivery in the background
+
+    If immediate delivery fails, the scheduled message processor will retry
+    with exponential backoff.
+    """
+    try:
+        # Queue the message (signs and inserts into database)
+        message_id = discovery_service.queue_outbound_message(
+            to_address=request.to_address,
+            from_address=request.from_address,
+            content=request.content,
+            message_type=request.message_type,
+            priority=request.priority,
+            metadata=request.metadata
+        )
+
+        # Trigger immediate delivery in background
+        background_tasks.add_task(discovery_service.deliver_message_async, message_id)
+
+        return SendMessageResponse(
+            status="queued",
+            message_id=message_id,
+            immediate_delivery=True
+        )
+
+    except ValueError as e:
+        logger.warning(f"Invalid send request: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error queueing federated message: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/v1/domain/verify")

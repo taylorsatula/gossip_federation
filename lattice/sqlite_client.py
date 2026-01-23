@@ -228,9 +228,10 @@ class SQLiteClient:
         conn = self._get_connection()
         try:
             cursor = conn.execute(converted_query, converted_params)
-            conn.commit()
             # SQLite 3.35+ supports RETURNING natively
+            # IMPORTANT: fetchall() BEFORE commit() - SQLite holds locks until fetch completes
             rows = cursor.fetchall()
+            conn.commit()
             return [self._row_to_dict(row) for row in rows]
         finally:
             conn.close()
