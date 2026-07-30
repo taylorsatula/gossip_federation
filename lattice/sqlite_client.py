@@ -44,9 +44,35 @@ class SQLiteClient:
         conn = self._get_connection()
         try:
             conn.executescript(schema_sql)
+            self._run_migrations(conn)
             conn.commit()
         finally:
             conn.close()
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        """Apply lightweight SQLite migrations for existing databases."""
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(lattice_received_messages)").fetchall()
+        }
+
+        if "status" not in columns:
+            conn.execute(
+                "ALTER TABLE lattice_received_messages "
+                "ADD COLUMN status TEXT NOT NULL DEFAULT 'accepted'"
+            )
+
+        if "completed_at" not in columns:
+            conn.execute(
+                "ALTER TABLE lattice_received_messages "
+                "ADD COLUMN completed_at TEXT"
+            )
+
+        if "ack_data" not in columns:
+            conn.execute(
+                "ALTER TABLE lattice_received_messages "
+                "ADD COLUMN ack_data TEXT"
+            )
 
     def _convert_params(
         self, query: str, params: Union[Dict, Tuple, List, None]

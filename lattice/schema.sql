@@ -127,7 +127,10 @@ CREATE INDEX IF NOT EXISTS idx_lattice_messages_priority_queue ON lattice_messag
 CREATE TABLE IF NOT EXISTS lattice_received_messages (
     message_id TEXT PRIMARY KEY,
     from_address TEXT NOT NULL,
-    received_at TEXT NOT NULL DEFAULT (datetime('now'))
+    received_at TEXT NOT NULL DEFAULT (datetime('now')),
+    status TEXT NOT NULL DEFAULT 'accepted' CHECK (status IN ('processing', 'accepted', 'rejected')),
+    completed_at TEXT,
+    ack_data TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_received_messages_cleanup ON lattice_received_messages(received_at);
