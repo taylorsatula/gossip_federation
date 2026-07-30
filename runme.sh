@@ -49,14 +49,22 @@ if [ -z "$APP_URL" ]; then
     exit 1
 fi
 
-read -p "Bootstrap servers [https://lattice.miraos.org]: " BOOTSTRAP
-BOOTSTRAP="${BOOTSTRAP:-https://lattice.miraos.org}"
+read -p "Bootstrap servers (comma-separated, blank for none): " BOOTSTRAP
+read -p "Bootstrap pins (host=fingerprint, comma-separated, required when bootstrap is set): " BOOTSTRAP_PINS
+if [ -n "$BOOTSTRAP" ] && [ -z "$BOOTSTRAP_PINS" ]; then
+    echo "Error: Bootstrap fingerprint pins are required for bootstrap servers"
+    exit 1
+fi
+
+ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 
 sudo mkdir -p /etc/lattice
 sudo chown -R "$(whoami)" /etc/lattice
 cat > /etc/lattice/config.env <<EOF
 APP_URL=$APP_URL
 LATTICE_BOOTSTRAP_SERVERS=$BOOTSTRAP
+LATTICE_BOOTSTRAP_PINS=$BOOTSTRAP_PINS
+LATTICE_ADMIN_TOKEN=$ADMIN_TOKEN
 EOF
 chmod 600 /etc/lattice/config.env
 echo "Config written to /etc/lattice/config.env"
@@ -74,6 +82,19 @@ print(f\"UUID: {result['server_uuid']}\")
 # Phase 6: Systemd
 echo "Setting up systemd service..."
 
+sudo mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
+if command -v useradd >/dev/null 2>&1; then
+    if ! id -u lattice >/dev/null 2>&1; then
+        sudo useradd --system --home "$INSTALL_DIR" --shell /usr/sbin/nologin lattice
+    fi
+    SERVICE_USER="lattice"
+    SERVICE_GROUP="lattice"
+else
+    SERVICE_USER="$(whoami)"
+    SERVICE_GROUP="$(id -gn)"
+fi
+sudo chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR" /etc/lattice
+
 sudo tee /etc/systemd/system/lattice.service > /dev/null <<EOF
 [Unit]
 Description=Lattice Discovery Daemon
@@ -81,10 +102,22 @@ After=network.target
 
 [Service]
 Type=simple
-User=$(whoami)
+User=$SERVICE_USER
+Group=$SERVICE_GROUP
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/venv/bin/uvicorn lattice.discovery_daemon:app --host 0.0.0.0 --port 1113
+Environment="PATH=$INSTALL_DIR/venv/bin:/usr/local/bin:/usr/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="LATTICE_DB_PATH=$INSTALL_DIR/data/lattice.db"
+LoadCredential=private_key:/etc/lattice/private_key.pem
+LoadCredential=config:/etc/lattice/config.env
+ExecStart=$INSTALL_DIR/venv/bin/uvicorn lattice.discovery_daemon:app --host 0.0.0.0 --port 1113 --workers 1
 Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$INSTALL_DIR/data $INSTALL_DIR/logs /etc/lattice
 
 [Install]
 WantedBy=multi-user.target
