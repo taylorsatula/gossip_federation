@@ -31,20 +31,27 @@ pip install -e .
 # Default SQLite database: lattice.db (configure with LATTICE_DB_PATH env var)
 
 # Start daemon
+export LATTICE_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 uvicorn lattice.discovery_daemon:app --host 0.0.0.0 --port 1113
 ```
 
 
 ### REST Endpoints
 
+Admin endpoints require `X-Lattice-Admin-Token: <token>` and should not be exposed by a reverse proxy.
+
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | Health check |
-| `GET /api/v1/identity` | Get server federation identity |
-| `GET /api/v1/peers` | List known peers |
-| `POST /api/v1/announce` | Trigger gossip round |
+| `GET /status` | Public liveness status |
+| `GET /api/v1/announcement` | Public signed server announcement |
 | `POST /api/v1/gossip/receive` | Receive announcements |
-| `POST /api/v1/route/{domain}` | Resolve domain to endpoint |
+| `POST /api/v1/domain/query` | Receive signed route query from a known peer |
+| `POST /api/v1/federation/messages/receive` | Receive signed federated message |
+| `GET /health` | Admin health check |
+| `GET /api/v1/identity` | Admin server federation identity |
+| `GET /api/v1/peers` | Admin peer list |
+| `POST /api/v1/announce` | Admin trigger gossip round |
+| `POST /api/v1/route/{domain}` | Admin resolve domain to endpoint |
 
 ### Integration with External Systems
 
@@ -182,11 +189,13 @@ When a server doesn't know how to reach a domain:
   "domain": "west-office",
   "requester": "acme-corp",
   "max_hops": 10,
-  "timestamp": "2024-01-15T10:35:00Z"
+  "timestamp": "2024-01-15T10:35:00Z",
+  "signature": "base64-encoded-rsa-signature..."
 }
 ```
 
-The query propagates through the network (up to `max_hops`) until someone knows the answer.
+The query propagates through the network (up to `max_hops`) until someone knows the answer. Each hop re-signs the query as the immediate requester, and receivers reject unsigned or stale queries.
+Route answers are accepted only when they match an already-known, non-blocked peer and its trusted federation endpoint; this avoids unauthenticated route insertion in the current protocol.
 
 ### 4. Domain Response
 

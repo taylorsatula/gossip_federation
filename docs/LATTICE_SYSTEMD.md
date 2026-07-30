@@ -7,7 +7,7 @@ This document describes how to set up the Lattice discovery daemon as a systemd 
 The easiest way to deploy is using the deploy script:
 
 ```bash
-./deploy.sh
+./runme.sh
 ```
 
 This handles secrets setup, identity generation, and systemd configuration automatically.
@@ -35,7 +35,10 @@ sudo chmod 700 /etc/lattice
 # Create config file
 sudo tee /etc/lattice/config.env > /dev/null <<EOF
 APP_URL=https://your-server.com
-LATTICE_BOOTSTRAP_SERVERS=https://lattice.miraos.org
+LATTICE_ADMIN_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+# Optional bootstrap requires an out-of-band fingerprint pin:
+# LATTICE_BOOTSTRAP_SERVERS=https://bootstrap.example.com
+# LATTICE_BOOTSTRAP_PINS=bootstrap.example.com=ABCD1234...
 EOF
 sudo chmod 600 /etc/lattice/config.env
 ```
@@ -52,7 +55,7 @@ sudo systemd-creds encrypt --name=private_key /etc/lattice/private_key.pem /etc/
 sudo systemd-creds encrypt --name=config /etc/lattice/config.env /etc/lattice/config.cred
 ```
 
-The service file uses `LoadCredentialEncrypted=` for encrypted credentials or `LoadCredential=` as fallback.
+The provided service file uses `LoadCredential=` for `private_key` and `config`. To use encrypted credentials, change those directives to `LoadCredentialEncrypted=` and point them at encrypted `.cred` files.
 
 ## Service Management
 
@@ -122,7 +125,7 @@ The main application schedules periodic HTTP calls to the discovery daemon:
 - **Neighbor updates**: `POST http://localhost:1113/api/v1/maintenance/update_neighbors` (every 6 hours)
 - **Cleanup**: `POST http://localhost:1113/api/v1/maintenance/cleanup` (daily)
 
-These are registered automatically when the application starts (see `lattice/init_lattice.py`).
+These are registered automatically when the application starts (see `lattice/init_lattice.py`) and include the `X-Lattice-Admin-Token` header.
 
 ## Monitoring
 
@@ -130,7 +133,7 @@ These are registered automatically when the application starts (see `lattice/ini
 
 ```bash
 curl http://localhost:1113/status
-curl http://localhost:1113/health  # localhost only
+curl -H "X-Lattice-Admin-Token: $LATTICE_ADMIN_TOKEN" http://localhost:1113/health
 ```
 
 ### Service Metrics
@@ -153,12 +156,43 @@ systemctl show lattice --property=MemoryCurrent,CPUUsage
 For external federation access:
 
 ```nginx
+proxy_http_version 1.1;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+
 location /discovery/ {
-    proxy_pass http://localhost:1113/;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+    return 404;
+}
+
+location = /status {
+    proxy_pass http://localhost:1113/status;
+}
+
+location = /api/v1/announcement {
+    proxy_pass http://localhost:1113/api/v1/announcement;
+}
+
+location = /api/v1/gossip/receive {
+    proxy_pass http://localhost:1113/api/v1/gossip/receive;
+}
+
+location = /api/v1/domain/query {
+    proxy_pass http://localhost:1113/api/v1/domain/query;
+}
+
+location = /api/v1/federation/messages/receive {
+    proxy_pass http://localhost:1113/api/v1/federation/messages/receive;
+}
+
+location ~ ^/(health|api/v1/(identity|peers|announce|route|domain/(verify|register)|messages/send|maintenance/)) {
+    return 404;
+}
+
+location / {
+    return 404;
 }
 ```
+
+Do not proxy the daemon root to the public internet. Only the public federation endpoints above should be externally reachable.

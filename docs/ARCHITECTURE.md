@@ -88,8 +88,9 @@ def __init__(self):
 5. Discovery daemon's `process_message_queue()` reads pending messages
 6. Circuit breaker check - skip if peer has too many failures
 7. `_deliver_single_message()` sends HTTP POST to remote server's federation endpoint
-8. Status updated to 'delivered' or retried with exponential backoff (2, 4, 8 minutes)
-9. After 5 consecutive failures, circuit breaker opens for 15 minutes
+8. Remote server returns a signed delivery acknowledgment
+9. Status updated to 'delivered' or retried with exponential backoff (2, 4, 8 minutes)
+10. After 5 consecutive failures, circuit breaker opens for 15 minutes
 
 ### Remote → Local (Inbound)
 1. Remote server POSTs to `/api/federation/v1/messages/receive`
@@ -97,11 +98,12 @@ def __init__(self):
 3. Extract sender domain from `from_address`
 4. Look up sender's peer record from `lattice_peers` table
 5. **Signature verification** - verify RSA signature using sender's public key
-6. **Prompt injection filtering** - all content treated as UNTRUSTED
-7. Username resolution via external resolver (configured via `set_username_resolver()`)
-8. Create PagerTool instance for recipient user
-9. `PagerTool.deliver_federated_message()` writes message to user's local pager (write-only)
-10. Return 200 OK with acceptance status
+6. **Recipient domain check** - reject messages not addressed to this server
+7. **Prompt injection filtering** - all content treated as UNTRUSTED
+8. Username resolution via external resolver (configured via `set_username_resolver()`)
+9. Create PagerTool instance for recipient user
+10. `PagerTool.deliver_federated_message()` writes message to user's local pager (write-only)
+11. Return 200 OK with a signed acknowledgment
 
 ---
 
@@ -113,6 +115,9 @@ def __init__(self):
 - **Circuit breaker** - 5 failures → 15 minute timeout per peer
 - **Write-only delivery** - Federation can't read user data, only write messages
 - **Secure credential storage** - Private keys via systemd credentials (encrypted) or file-based with 600 permissions
+- **Admin token** - Internal endpoints require `X-Lattice-Admin-Token`
+- **Pinned bootstrap** - Bootstrap servers require out-of-band public key fingerprint pins by default
+- **Signed route queries** - Domain queries are signed and stale queries are rejected
 
 ---
 
@@ -168,13 +173,14 @@ See `LATTICE_SYSTEMD.md` for systemd setup instructions.
 | Neighbor selection | 6 hours | `POST /api/v1/maintenance/update_neighbors` |
 | Cleanup | Daily | `POST /api/v1/maintenance/cleanup` |
 
-The main application's scheduler calls these endpoints on the discovery daemon (port 1113).
+The main application's scheduler calls these admin endpoints on the discovery daemon (port 1113) with `X-Lattice-Admin-Token`.
 
 ---
 
 ## Network Topology Confidence
 
 The system uses a **network visibility saturation model** to determine when it has a strong view of the federation topology.
+Domain responses are used only to validate routes for peers already known locally; new peer trust is established through signed announcements, not domain-query answers.
 
 ### Confidence Calculation
 
