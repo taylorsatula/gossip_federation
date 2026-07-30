@@ -6,11 +6,13 @@ Implements the protocol for verifying domain name uniqueness before registration
 
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
+from dateutil import parser as dateutil_parser
 from pydantic import BaseModel, Field
 
 from .sqlite_client import SQLiteClient
-from .models import DomainQuery, DomainResponse
+from .models import DomainQuery, DomainResponse, _validate_endpoint_url
 from .peer_manager import PeerManager
 from .gossip_protocol import GossipProtocol
 
@@ -38,10 +40,62 @@ class DomainRegistrationResult(BaseModel):
 class DomainRegistrationService:
     """Handles domain name registration and uniqueness verification."""
 
-    def __init__(self):
-        self.db = SQLiteClient()
-        self.peer_manager = PeerManager()
-        self.gossip_protocol = GossipProtocol()
+    def __init__(
+        self,
+        db: Optional[SQLiteClient] = None,
+        peer_manager: Optional[PeerManager] = None,
+        gossip_protocol: Optional[GossipProtocol] = None
+    ):
+        self.db = db or SQLiteClient()
+        self.peer_manager = peer_manager or PeerManager()
+        self.gossip_protocol = gossip_protocol or GossipProtocol()
+
+    def _sign_domain_query(self, query: DomainQuery) -> DomainQuery:
+        """Sign an outbound domain query with this server's identity."""
+        query.signature = ""
+        query.signature = self.gossip_protocol.sign_message(query.model_dump(exclude={"signature"}))
+        return query
+
+    def _validate_domain_response(self, response: DomainResponse, query: DomainQuery) -> Optional[DomainResponse]:
+        """Accept only route answers that match known local peer records."""
+        if response.query_id != query.query_id or response.domain != query.domain:
+            logger.warning("Rejected domain response with mismatched query data")
+            return None
+
+        try:
+            response_time = dateutil_parser.parse(response.timestamp)
+            if response_time.tzinfo is None:
+                response_time = response_time.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - response_time.astimezone(timezone.utc)
+            if age > timedelta(minutes=5) or age < timedelta(minutes=-5):
+                logger.warning("Rejected stale domain response for %s", response.domain)
+                return None
+        except (TypeError, ValueError):
+            logger.warning("Rejected domain response with invalid timestamp for %s", response.domain)
+            return None
+
+        if not response.found:
+            return response
+
+        if not response.server_id or not response.endpoint_url:
+            logger.warning("Rejected incomplete domain response for %s", response.domain)
+            return None
+
+        if response.server_id.lower() != response.domain.lower():
+            logger.warning("Rejected domain response claiming %s for %s", response.server_id, response.domain)
+            return None
+
+        peer = self.peer_manager.get_peer_by_domain(response.server_id)
+        if not peer or peer.get("trust_status") in {"blocked", "revoked"}:
+            logger.warning("Rejected domain response for unknown or blocked peer %s", response.server_id)
+            return None
+
+        trusted_endpoint = peer.get("endpoints", {}).get("federation")
+        if trusted_endpoint != response.endpoint_url:
+            logger.warning("Rejected domain response with untrusted endpoint for %s", response.server_id)
+            return None
+
+        return response
 
     def verify_domain_availability(
         self,
@@ -79,6 +133,8 @@ class DomainRegistrationService:
                 return DomainRegistrationResult(
                     domain=desired_domain,
                     available=True,
+                    confidence=1.0,
+                    servers_queried=0,
                     message=f"Domain '{desired_domain}' is already registered to you"
                 )
             else:
@@ -96,9 +152,10 @@ class DomainRegistrationService:
         query = DomainQuery(
             query_id=f"REG-{int(time.time() * 1000)}",
             domain=desired_domain,
-            requester=requester_uuid,
+            requester=self.gossip_protocol.get_server_id() or requester_uuid,
             max_hops=max_hops
         )
+        self._sign_domain_query(query)
 
         # Get active neighbors
         neighbors = self.peer_manager.get_active_neighbors()
@@ -127,6 +184,7 @@ class DomainRegistrationService:
                     endpoint = neighbor['endpoints'].get('discovery')
                     if not endpoint:
                         continue
+                    _validate_endpoint_url(endpoint)
 
                     response = client.post(
                         f"{endpoint}/api/v1/domain/query",
@@ -138,11 +196,12 @@ class DomainRegistrationService:
 
                     if response.status_code == 200:
                         result = DomainResponse(**response.json())
-                        if result.found:
+                        validated = self._validate_domain_response(result, query)
+                        if validated and validated.found:
                             # Someone has this domain
-                            found_owner = result.server_id
+                            found_owner = validated.server_id
                             logger.warning(
-                                f"Domain '{desired_domain}' already claimed by {result.server_id}"
+                                f"Domain '{desired_domain}' already claimed by {validated.server_id}"
                             )
                             break
 
