@@ -6,24 +6,49 @@ and signature-verified correctly across the gossip protocol flow.
 """
 
 import json
-import pytest
+import os
+import tempfile
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
 from lattice.gossip_protocol import GossipProtocol
 from lattice.models import ServerAnnouncement, ServerEndpoints
 
 
+def make_test_gossip():
+    """Create a GossipProtocol with an in-memory test identity."""
+    db_fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(db_fd)
+    previous_db_path = os.environ.get("LATTICE_DB_PATH")
+    os.environ["LATTICE_DB_PATH"] = db_path
+    try:
+        gossip = GossipProtocol()
+    finally:
+        if previous_db_path is None:
+            os.environ.pop("LATTICE_DB_PATH", None)
+        else:
+            os.environ["LATTICE_DB_PATH"] = previous_db_path
+        os.unlink(db_path)
+
+    private_pem, public_pem = gossip.generate_keypair()
+    gossip._private_key = serialization.load_pem_private_key(
+        private_pem.encode(),
+        password=None,
+        backend=default_backend()
+    )
+    gossip._public_key = serialization.load_pem_public_key(
+        public_pem.encode(),
+        backend=default_backend()
+    )
+    gossip._server_id = "test.example.com"
+    gossip._server_uuid = "test-uuid-1234"
+    return gossip
+
+
 def test_announcement_signature_roundtrip():
     """Test that announcement signatures survive serialization/deserialization."""
     # Initialize gossip protocol
-    gossip = GossipProtocol()
-
-    # Fail explicitly if lattice identity is missing
-    assert gossip._server_id, (
-        "Lattice identity not initialized. "
-        "Run 'python -c \"from lattice.init_lattice import ensure_lattice_identity; ensure_lattice_identity()\"' "
-        "to create server identity before running tests."
-    )
+    gossip = make_test_gossip()
 
     # Create announcement
     announcement = ServerAnnouncement(
@@ -34,8 +59,8 @@ def test_announcement_signature_roundtrip():
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         ).decode('utf-8'),
         endpoints=ServerEndpoints(
-            federation="https://example.com/api/federation",
-            discovery="https://example.com/api/discovery"
+            federation="https://1.1.1.1/api/federation",
+            discovery="https://1.1.1.1/api/discovery"
         ),
         signature=""  # Will be set after signing
     )
@@ -90,11 +115,7 @@ def test_announcement_signature_roundtrip():
 
 def test_signature_verification_rejects_tampered_message():
     """Test that signature verification rejects tampered messages."""
-    gossip = GossipProtocol()
-
-    assert gossip._server_id, (
-        "Lattice identity not initialized. Cannot test signature rejection without server keys."
-    )
+    gossip = make_test_gossip()
 
     # Create and sign announcement
     announcement = ServerAnnouncement(
@@ -105,8 +126,8 @@ def test_signature_verification_rejects_tampered_message():
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         ).decode('utf-8'),
         endpoints=ServerEndpoints(
-            federation="https://example.com/api/federation",
-            discovery="https://example.com/api/discovery"
+            federation="https://1.1.1.1/api/federation",
+            discovery="https://1.1.1.1/api/discovery"
         ),
         signature=""
     )
@@ -130,11 +151,7 @@ def test_signature_verification_rejects_tampered_message():
 
 def test_signature_verification_with_wrong_key():
     """Test that signature verification fails with wrong public key."""
-    gossip = GossipProtocol()
-
-    assert gossip._server_id, (
-        "Lattice identity not initialized. Cannot test key mismatch without server keys."
-    )
+    gossip = make_test_gossip()
 
     # Generate a different keypair
     wrong_private, wrong_public = gossip.generate_keypair()
@@ -148,8 +165,8 @@ def test_signature_verification_with_wrong_key():
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         ).decode('utf-8'),
         endpoints=ServerEndpoints(
-            federation="https://example.com/api/federation",
-            discovery="https://example.com/api/discovery"
+            federation="https://1.1.1.1/api/federation",
+            discovery="https://1.1.1.1/api/discovery"
         ),
         signature=""
     )

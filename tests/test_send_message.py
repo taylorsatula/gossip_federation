@@ -9,13 +9,15 @@ import hashlib
 import json
 import os
 import tempfile
+import base64
 import pytest
 from unittest.mock import Mock, patch
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.backends import default_backend
 
 
@@ -39,6 +41,55 @@ def generate_test_keypair():
     ).decode('utf-8')
 
     return private_pem, public_pem, private_key
+
+
+def sign_payload(private_key, payload):
+    canonical = json.dumps(payload, sort_keys=True)
+    signature = private_key.sign(
+        canonical.encode(),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH
+        ),
+        hashes.SHA256()
+    )
+    return base64.b64encode(signature).decode("utf-8")
+
+
+def make_remote_ack(env, message_id):
+    ack = {
+        "version": "1.0",
+        "ack_type": "message_received",
+        "message_id": message_id,
+        "status": "delivered",
+        "recipient_server": "remote.example.com",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "error_message": None,
+        "error_code": None
+    }
+    ack["signature"] = sign_payload(env["remote_private_key"], ack)
+    return ack
+
+
+def make_remote_rejection_ack(env, message_id, reason="Unknown recipient"):
+    ack = {
+        "version": "1.0",
+        "ack_type": "message_failed",
+        "message_id": message_id,
+        "status": "rejected",
+        "recipient_server": "remote.example.com",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "error_message": reason,
+        "error_code": None
+    }
+    ack["signature"] = sign_payload(env["remote_private_key"], ack)
+    return ack
+
+
+def successful_remote_response(env):
+    def _send(_url, data):
+        return {"status": "accepted", "ack": make_remote_ack(env, data["message_id"])}
+    return _send
 
 
 @pytest.fixture
@@ -68,7 +119,7 @@ def test_env():
     )
 
     # Insert a test peer (remote server we'll send to)
-    remote_private, remote_public, _ = generate_test_keypair()
+    remote_private, remote_public, remote_private_key = generate_test_keypair()
     db.execute_insert(
         """INSERT INTO lattice_peers
            (id, server_id, server_uuid, public_key, endpoints, trust_status, is_neighbor)
@@ -95,6 +146,7 @@ def test_env():
         'private_key': private_key,
         'fingerprint': fingerprint,
         'remote_public': remote_public,
+        'remote_private_key': remote_private_key,
     }
 
     # Cleanup
@@ -107,7 +159,7 @@ def test_env():
 def app_client(test_env):
     """Create test client with real database and crypto, mocked HTTP only."""
     # Import after env var is set
-    from lattice.discovery_daemon import app, discovery_service, localhost_only
+    from lattice.discovery_daemon import app, discovery_service, admin_only
 
     # Point all components at our test database
     from lattice.sqlite_client import SQLiteClient
@@ -116,20 +168,26 @@ def app_client(test_env):
     discovery_service.db = test_db
     discovery_service.gossip_protocol.db = test_db
     discovery_service.peer_manager.db = test_db
+    discovery_service.domain_registration.db = test_db
+    discovery_service.domain_registration.peer_manager = discovery_service.peer_manager
+    discovery_service.domain_registration.gossip_protocol = discovery_service.gossip_protocol
 
     # Load the test private key into gossip protocol
     discovery_service.gossip_protocol._private_key = test_env['private_key']
     discovery_service.gossip_protocol._server_id = 'test.example.com'
     discovery_service.gossip_protocol._server_uuid = 'test-uuid-1234'
+    original_send = discovery_service._send_to_remote_server
+    discovery_service._send_to_remote_server = lambda *_args, **_kwargs: None
 
-    # Mock localhost check
-    async def mock_localhost():
-        return "127.0.0.1"
-    app.dependency_overrides[localhost_only] = mock_localhost
+    # Mock admin check
+    async def mock_admin():
+        return "admin"
+    app.dependency_overrides[admin_only] = mock_admin
 
     client = TestClient(app)
     yield client, discovery_service, test_env
 
+    discovery_service._send_to_remote_server = original_send
     app.dependency_overrides.clear()
 
 
@@ -458,7 +516,7 @@ class TestDeliverMessageAsync:
 
         # Mock successful HTTP response
         with patch.object(service, '_send_to_remote_server') as mock_send:
-            mock_send.return_value = {"status": "accepted", "ack": None}
+            mock_send.side_effect = successful_remote_response(env)
             await service.deliver_message_async(message_id)
 
         # Verify status is now delivered
@@ -492,6 +550,107 @@ class TestDeliverMessageAsync:
         assert row['status'] == 'pending'  # Still pending for retry
         assert row['attempt_count'] == 1
         assert row['last_error'] is not None
+
+    @pytest.mark.asyncio
+    async def test_signed_remote_rejection_fails_permanently(self, app_client):
+        """Verify signed business rejections are not retried."""
+        client, service, env = app_client
+
+        message_id = service.queue_outbound_message(
+            to_address="alice@remote.example.com",
+            from_address="bob@test.example.com",
+            content="Test permanent rejection"
+        )
+
+        with patch.object(service, '_send_to_remote_server') as mock_send:
+            mock_send.side_effect = lambda _url, data: {
+                "status": "rejected",
+                "ack": make_remote_rejection_ack(env, data["message_id"], "Unknown recipient")
+            }
+            await service.deliver_message_async(message_id)
+
+        row = env['db'].execute_single(
+            """
+            SELECT status, attempt_count, last_error, ack_received, ack_data
+            FROM lattice_messages
+            WHERE message_id = ?
+            """,
+            (message_id,)
+        )
+        peer = env['db'].execute_single(
+            "SELECT circuit_failures FROM lattice_peers WHERE server_id = ?",
+            ("remote.example.com",)
+        )
+
+        assert row['status'] == 'failed'
+        assert row['attempt_count'] == 0
+        assert "Unknown recipient" in row['last_error']
+        assert row['ack_received'] == 1
+        assert row['ack_data']['status'] == 'rejected'
+        assert peer['circuit_failures'] == 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_rejection_ack_is_retryable(self, app_client):
+        """Verify invalid rejection acknowledgments are treated as delivery failures."""
+        client, service, env = app_client
+
+        message_id = service.queue_outbound_message(
+            to_address="alice@remote.example.com",
+            from_address="bob@test.example.com",
+            content="Test invalid rejection"
+        )
+
+        with patch.object(service, '_send_to_remote_server') as mock_send:
+            def invalid_rejection(_url, data):
+                ack = make_remote_rejection_ack(env, data["message_id"])
+                ack["signature"] = "invalid"
+                return {"status": "rejected", "ack": ack}
+
+            mock_send.side_effect = invalid_rejection
+            await service.deliver_message_async(message_id)
+
+        row = env['db'].execute_single(
+            "SELECT status, attempt_count, last_error FROM lattice_messages WHERE message_id = ?",
+            (message_id,)
+        )
+        peer = env['db'].execute_single(
+            "SELECT circuit_failures FROM lattice_peers WHERE server_id = ?",
+            ("remote.example.com",)
+        )
+
+        assert row['status'] == 'pending'
+        assert row['attempt_count'] == 1
+        assert row['last_error'] is not None
+        assert peer['circuit_failures'] == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_rejection_ack_is_retryable(self, app_client):
+        """Verify missing acknowledgments still follow retry logic."""
+        client, service, env = app_client
+
+        message_id = service.queue_outbound_message(
+            to_address="alice@remote.example.com",
+            from_address="bob@test.example.com",
+            content="Test missing ack"
+        )
+
+        with patch.object(service, '_send_to_remote_server') as mock_send:
+            mock_send.return_value = {"status": "rejected"}
+            await service.deliver_message_async(message_id)
+
+        row = env['db'].execute_single(
+            "SELECT status, attempt_count, last_error FROM lattice_messages WHERE message_id = ?",
+            (message_id,)
+        )
+        peer = env['db'].execute_single(
+            "SELECT circuit_failures FROM lattice_peers WHERE server_id = ?",
+            ("remote.example.com",)
+        )
+
+        assert row['status'] == 'pending'
+        assert row['attempt_count'] == 1
+        assert row['last_error'] is not None
+        assert peer['circuit_failures'] == 1
 
     @pytest.mark.asyncio
     async def test_nonexistent_message_handled_gracefully(self, app_client):
@@ -533,7 +692,7 @@ class TestEndToEndDelivery:
 
         # Mock the remote server response
         with patch.object(service, '_send_to_remote_server') as mock_send:
-            mock_send.return_value = {"status": "accepted", "ack": None}
+            mock_send.side_effect = successful_remote_response(env)
 
             response = client.post(
                 "/api/v1/messages/send",
