@@ -6,18 +6,21 @@ Provides REST API for local tools to query routes.
 """
 
 import asyncio
-import ipaddress
+import hmac
+import json
 import logging
 import os
-import random
+import secrets as secrets_module
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from dateutil import parser as dateutil_parser
+from pydantic import BaseModel, Field, field_validator
 
 from .sqlite_client import SQLiteClient
 from .models import (
@@ -27,7 +30,10 @@ from .models import (
     GossipMessage,
     PeerExchangeFile,
     FederatedMessage,
-    MessageAcknowledgment
+    MessageAcknowledgment,
+    MAX_METADATA_BYTES,
+    _validate_json_size,
+    _validate_endpoint_url
 )
 from .username_resolver import resolve_username, has_username_resolver
 from .peer_manager import PeerManager
@@ -37,6 +43,7 @@ from .domain_registration import (
     DomainRegistrationRequest,
     DomainRegistrationResult
 )
+from .secrets import load_config
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -88,9 +95,15 @@ class SendMessageRequest(BaseModel):
     to_address: str = Field(description="Recipient address (e.g., alex@remote.otherserver.com)")
     from_address: str = Field(description="Sender address (e.g., taylor@local.ourserver.com)")
     content: str = Field(max_length=10000, description="Message content (max 10KB)")
-    message_type: str = Field(default="pager", description="Message type: pager, location, ai_to_ai")
+    message_type: Literal["pager", "location", "ai_to_ai"] = Field(default="pager", description="Message type: pager, location, ai_to_ai")
     priority: int = Field(default=0, ge=0, le=2, description="0=normal, 1=high, 2=urgent")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata_size(cls, value):
+        """Bound metadata accepted by the local send API."""
+        return _validate_json_size(value, MAX_METADATA_BYTES, "metadata")
 
 
 class SendMessageResponse(BaseModel):
@@ -104,42 +117,134 @@ class SendMessageResponse(BaseModel):
 # Access Control
 # =====================================================================
 
-async def localhost_only(request: Request):
-    """
-    FastAPI dependency that restricts endpoint access to localhost only.
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
 
-    Use this for admin/maintenance endpoints that should not be exposed
-    to the network (health checks, peer listings, maintenance tasks).
 
-    Handles IPv4-mapped IPv6 addresses (e.g., ::ffff:127.0.0.1) by normalizing
-    them to their IPv4 equivalent before checking.
+class PermanentDeliveryFailure(Exception):
+    """Raised after a signed remote rejection permanently fails a message."""
+
+
+def _load_admin_token() -> Optional[str]:
+    """Load the local admin API token from env/config/credentials."""
+    return (
+        os.getenv("LATTICE_ADMIN_TOKEN")
+        or os.getenv("ADMIN_TOKEN")
+        or load_config("ADMIN_TOKEN")
+    )
+
+
+async def admin_only(request: Request):
     """
-    client_host = request.client.host if request.client else None
-    if not client_host:
+    FastAPI dependency for local/admin endpoints.
+
+    Reverse proxies can make every request appear local. A shared admin token
+    keeps internal state-changing endpoints protected even when the daemon is
+    bound to a public interface for federation traffic.
+    """
+    expected = _load_admin_token()
+    if not expected:
         raise HTTPException(
-            status_code=403,
-            detail="This endpoint is restricted to localhost only"
+            status_code=503,
+            detail="Admin API token is not configured"
         )
 
+    supplied = request.headers.get("X-Lattice-Admin-Token", "")
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=403,
+            detail="Admin API token required"
+        )
+
+    return "admin"
+
+
+def _now_iso() -> str:
+    """Current UTC timestamp in the format used for persisted comparisons."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_timestamp(value: str, field_name: str) -> datetime:
+    """Parse protocol timestamps and normalize them to UTC-aware datetimes."""
     try:
-        ip = ipaddress.ip_address(client_host)
-        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:127.0.0.1)
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-            ip = ip.ipv4_mapped
+        parsed = dateutil_parser.parse(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {field_name} timestamp") from exc
 
-        if not ip.is_loopback:
-            raise HTTPException(
-                status_code=403,
-                detail="This endpoint is restricted to localhost only"
-            )
-    except ValueError:
-        # Not a valid IP address
-        raise HTTPException(
-            status_code=403,
-            detail="This endpoint is restricted to localhost only"
-        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
-    return client_host
+
+def _validate_fresh_timestamp(
+    value: str,
+    field_name: str,
+    *,
+    max_age: timedelta,
+    future_skew: timedelta = timedelta(minutes=5)
+) -> None:
+    """Reject stale or future-dated protocol messages."""
+    timestamp = _parse_timestamp(value, field_name)
+    age = datetime.now(timezone.utc) - timestamp
+    if age > max_age:
+        raise ValueError(f"{field_name} timestamp is stale")
+    if age < -future_skew:
+        raise ValueError(f"{field_name} timestamp is too far in the future")
+
+
+def _domain_query_payload(query: DomainQuery) -> Dict[str, Any]:
+    """Return the signed portion of a DomainQuery."""
+    return query.model_dump(exclude={"signature"})
+
+
+class RequestBodyLimitMiddleware:
+    """Reject oversized request bodies, including chunked bodies."""
+
+    def __init__(self, app: Any, max_body_bytes: int):
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        content_length = headers.get(b"content-length")
+        if content_length:
+            try:
+                if int(content_length) > self.max_body_bytes:
+                    response = JSONResponse(status_code=413, content={"detail": "Request body too large"})
+                    await response(scope, receive, send)
+                    return
+            except ValueError:
+                response = JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
+                await response(scope, receive, send)
+                return
+
+        bytes_received = 0
+        buffered_messages: List[Dict[str, Any]] = []
+
+        while True:
+            message = await receive()
+            buffered_messages.append(message)
+
+            if message.get("type") == "http.request":
+                bytes_received += len(message.get("body") or b"")
+                if bytes_received > self.max_body_bytes:
+                    response = JSONResponse(status_code=413, content={"detail": "Request body too large"})
+                    await response(scope, receive, send)
+                    return
+                if not message.get("more_body", False):
+                    break
+            else:
+                break
+
+        async def replay_receive() -> Dict[str, Any]:
+            if buffered_messages:
+                return buffered_messages.pop(0)
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await self.app(scope, replay_receive, send)
 
 
 # =====================================================================
@@ -150,12 +255,19 @@ class DiscoveryService:
     """Core discovery service logic."""
 
     def __init__(self):
+        self.db = SQLiteClient()
         self.peer_manager = PeerManager()
         self.gossip_protocol = GossipProtocol()
-        self.domain_registration = DomainRegistrationService()
-        self.db = SQLiteClient()
+        self.domain_registration = DomainRegistrationService(
+            db=self.db,
+            peer_manager=self.peer_manager,
+            gossip_protocol=self.gossip_protocol
+        )
         self.last_gossip_time = None
         self.bootstrap_servers: List[str] = []
+        self.bootstrap_pins: Dict[str, str] = {}
+        self.allow_unpinned_bootstrap = False
+        self._rng = secrets_module.SystemRandom()
 
         # Status tracking for /status and /health endpoints
         self.start_time = datetime.now(timezone.utc)
@@ -171,8 +283,159 @@ class DiscoveryService:
         self._processed_queries: OrderedDict[str, Any] = OrderedDict()  # query_id -> timestamp
         self._max_query_cache_size = 1000  # Maximum entries before LRU eviction
 
+    def _load_bootstrap_trust_config(self) -> None:
+        """Load bootstrap fingerprint pins from config."""
+        pins = load_config("BOOTSTRAP_PINS") or ""
+        parsed_pins: Dict[str, str] = {}
+
+        for item in [part.strip() for part in pins.split(",") if part.strip()]:
+            if "=" not in item:
+                logger.warning("Ignoring malformed bootstrap pin entry")
+                continue
+            key, _, fingerprint = item.partition("=")
+            key = key.strip()
+            hostname = urlparse(key).hostname or key
+            if hostname:
+                parsed_pins[hostname.lower()] = fingerprint.replace(":", "").strip().upper()
+
+        self.bootstrap_pins = parsed_pins
+        allow_unpinned = (load_config("ALLOW_UNPINNED_BOOTSTRAP") or "").lower()
+        self.allow_unpinned_bootstrap = allow_unpinned in {"1", "true", "yes"}
+
+    def _verify_bootstrap_pin(self, bootstrap_url: str, announcement: ServerAnnouncement) -> bool:
+        """Verify that a bootstrap announcement matches its configured fingerprint pin."""
+        host = urlparse(bootstrap_url).hostname
+        if not host:
+            return False
+
+        expected = self.bootstrap_pins.get(host.lower())
+        actual = self.gossip_protocol.generate_fingerprint(announcement.public_key)
+
+        if not expected:
+            if self.allow_unpinned_bootstrap:
+                logger.warning(
+                    "Accepting unpinned bootstrap server %s because ALLOW_UNPINNED_BOOTSTRAP is enabled",
+                    host
+                )
+                return True
+            logger.error("Rejecting unpinned bootstrap server %s; configure LATTICE_BOOTSTRAP_PINS", host)
+            return False
+
+        if not hmac.compare_digest(expected, actual):
+            logger.error("Bootstrap fingerprint mismatch for %s", host)
+            return False
+
+        return True
+
+    def _sign_domain_query(self, query: DomainQuery) -> DomainQuery:
+        """Sign a domain query as this server."""
+        query.signature = ""
+        query.signature = self.gossip_protocol.sign_message(_domain_query_payload(query))
+        return query
+
+    def _verify_domain_query(self, query: DomainQuery, requester: Dict[str, Any]) -> bool:
+        """Verify a domain query from a known peer."""
+        if not query.signature:
+            return False
+
+        try:
+            _validate_fresh_timestamp(query.timestamp, "domain query", max_age=timedelta(minutes=5))
+        except ValueError as exc:
+            logger.warning("Rejected domain query %s: %s", query.query_id, exc)
+            return False
+
+        return self.gossip_protocol.verify_signature(
+            _domain_query_payload(query),
+            query.signature,
+            requester["public_key"]
+        )
+
+    def _validate_domain_response(
+        self,
+        result: DomainResponse,
+        query: DomainQuery,
+        responder: Dict[str, Any]
+    ) -> Optional[DomainResponse]:
+        """Constrain route answers to trusted local peer records."""
+        if result.query_id != query.query_id or result.domain != query.domain:
+            logger.warning("Rejected domain response with mismatched query data")
+            return None
+
+        try:
+            _validate_fresh_timestamp(result.timestamp, "domain response", max_age=timedelta(minutes=5))
+        except ValueError as exc:
+            logger.warning("Rejected stale domain response for %s: %s", result.domain, exc)
+            return None
+
+        if not result.found:
+            return result
+
+        if not result.server_id or not result.endpoint_url:
+            logger.warning("Rejected incomplete domain response for %s", result.domain)
+            return None
+
+        if result.server_id.lower() != result.domain.lower():
+            logger.warning(
+                "Rejected domain response for %s claiming different server_id %s",
+                result.domain,
+                result.server_id
+            )
+            return None
+
+        peer = self.peer_manager.get_peer_by_domain(result.server_id)
+        if not peer or peer.get("trust_status") in {"blocked", "revoked"}:
+            logger.warning("Rejected domain response for unknown or blocked peer %s", result.server_id)
+            return None
+
+        trusted_endpoint = peer.get("endpoints", {}).get("federation")
+        if not trusted_endpoint or trusted_endpoint != result.endpoint_url:
+            logger.warning("Rejected domain response with untrusted endpoint for %s", result.server_id)
+            return None
+
+        if responder.get("trust_status") in {"blocked", "revoked"}:
+            logger.warning("Rejected domain response from blocked responder %s", responder.get("server_id"))
+            return None
+
+        return result
+
+    def _get_known_peer_for_query(self, requester: str) -> Optional[Dict[str, Any]]:
+        """Rate-limit and return peer data for a domain query requester."""
+        try:
+            peer = self.db.execute_single(
+                """
+                UPDATE lattice_peers
+                SET query_count = CASE
+                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < datetime('now')
+                        THEN 1
+                        ELSE query_count + 1
+                    END,
+                    rate_limit_reset_at = CASE
+                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < datetime('now')
+                        THEN datetime('now', '+1 minute')
+                        ELSE rate_limit_reset_at
+                    END
+                WHERE server_id = %s
+                RETURNING server_id, public_key, trust_status, query_count
+                """,
+                (requester,)
+            )
+        except Exception as exc:
+            logger.error("Rate limit check failed for domain query from %s: %s", requester, exc)
+            raise HTTPException(status_code=503, detail="Rate limit check unavailable")
+
+        if not peer:
+            return None
+        if peer["query_count"] > 100:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        if peer["trust_status"] in {"blocked", "revoked"}:
+            raise HTTPException(status_code=403, detail="Requester is blocked")
+        return peer
+
     async def initialize(self):
         """Initialize the discovery service."""
+        self.gossip_protocol._load_identity()
+        self._load_bootstrap_trust_config()
+
         # Load bootstrap servers from database
         identity = self.db.execute_single(
             "SELECT bootstrap_servers FROM lattice_identity WHERE id = 1"
@@ -200,6 +463,7 @@ class DiscoveryService:
         async def _fetch_bootstrap(client, url):
             """Fetch single bootstrap server announcement."""
             try:
+                _validate_endpoint_url(url)
                 logger.info(f"Connecting to bootstrap server: {url}")
                 response = await client.get(f"{url}/api/v1/announcement")
 
@@ -207,6 +471,28 @@ class DiscoveryService:
                     announcement_data = response.json()
                     from .models import ServerAnnouncement
                     announcement = ServerAnnouncement(**announcement_data)
+
+                    ann_dict = announcement.model_dump(exclude={'signature'})
+                    if not self.gossip_protocol.verify_signature(
+                        ann_dict,
+                        announcement.signature,
+                        announcement.public_key
+                    ):
+                        logger.error(f"Rejected bootstrap {url}: invalid announcement signature")
+                        return
+
+                    try:
+                        _validate_fresh_timestamp(
+                            announcement.timestamp,
+                            "bootstrap announcement",
+                            max_age=timedelta(hours=1)
+                        )
+                    except ValueError as exc:
+                        logger.error(f"Rejected bootstrap {url}: {exc}")
+                        return
+
+                    if not self._verify_bootstrap_pin(url, announcement):
+                        return
 
                     # Add bootstrap server to peer list
                     self.peer_manager.add_or_update_peer(announcement)
@@ -241,7 +527,7 @@ class DiscoveryService:
 
             # Gossip to random subset of neighbors
             gossip_count = min(3, len(neighbors))
-            selected = random.sample(neighbors, gossip_count)
+            selected = self._rng.sample(neighbors, gossip_count)
 
             for neighbor in selected:
                 try:
@@ -268,6 +554,7 @@ class DiscoveryService:
             return
 
         try:
+            _validate_endpoint_url(endpoint)
             # Create gossip message
             from .models import GossipMessage
             gossip = GossipMessage(
@@ -309,16 +596,18 @@ class DiscoveryService:
         Called after gossip rounds to update the cached value.
         """
         try:
+            active_cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
             # Get current peer counts
             peer_stats = self.db.execute_single(
                 """
                 SELECT
                     COUNT(*) as total_peers,
                     COUNT(CASE WHEN is_neighbor = 1 THEN 1 END) as neighbors,
-                    COUNT(CASE WHEN last_seen_at > datetime('now', '-1 hour') THEN 1 END) as recently_active
+                    COUNT(CASE WHEN last_seen_at > %s THEN 1 END) as recently_active
                 FROM lattice_peers
-                WHERE trust_status != 'blocked'
-                """
+                WHERE trust_status NOT IN ('blocked', 'revoked')
+                """,
+                (active_cutoff,)
             )
 
             total_peers = peer_stats['total_peers'] if peer_stats else 0
@@ -360,20 +649,31 @@ class DiscoveryService:
         """Clean up old data."""
         # Clean up stale peers
         peer_count = self.peer_manager.cleanup_stale_peers(days=30)
+        now = _now_iso()
+        received_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
         # Clean up expired routes
         self.db.execute_delete(
-            "DELETE FROM lattice_routes WHERE expires_at < datetime('now')"
+            "DELETE FROM lattice_routes WHERE expires_at < %s",
+            (now,)
         )
 
         # Clean up old messages
         self.db.execute_delete(
-            "DELETE FROM lattice_messages WHERE expires_at < datetime('now') AND status IN ('delivered', 'failed', 'expired')"
+            "DELETE FROM lattice_messages WHERE expires_at < %s AND status IN ('delivered', 'failed', 'expired')",
+            (now,)
         )
 
         # Clean up received message tracking (keep 7 days for debugging)
         self.db.execute_delete(
-            "DELETE FROM lattice_received_messages WHERE received_at < datetime('now', '-7 days')"
+            "DELETE FROM lattice_received_messages WHERE received_at < %s",
+            (received_cutoff,)
+        )
+
+        processing_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        self.db.execute_delete(
+            "DELETE FROM lattice_received_messages WHERE status = 'processing' AND received_at < %s",
+            (processing_cutoff,)
         )
 
         # Reset stuck messages
@@ -396,16 +696,19 @@ class DiscoveryService:
             Number of messages reset
         """
         try:
+            now = _now_iso()
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
             result = self.db.execute_returning(
                 """
                 UPDATE lattice_messages
                 SET status = 'pending',
-                    next_attempt_at = datetime('now'),
-                    last_status_change_at = datetime('now')
+                    next_attempt_at = %s,
+                    last_status_change_at = %s
                 WHERE status = 'sending'
-                  AND last_status_change_at < datetime('now', '-5 minutes')
+                  AND last_status_change_at < %s
                 RETURNING message_id
-                """
+                """,
+                (now, now, cutoff)
             )
 
             count = len(result) if result else 0
@@ -463,18 +766,19 @@ class DiscoveryService:
             Statistics about processing
         """
         try:
+            now = _now_iso()
             # Get pending messages ready for delivery
             messages = self.db.execute_query(
                 """
                 SELECT *
                 FROM lattice_messages
                 WHERE status = 'pending'
-                  AND next_attempt_at <= datetime('now')
-                  AND expires_at > datetime('now')
+                  AND next_attempt_at <= %s
+                  AND expires_at > %s
                 ORDER BY priority DESC, created_at ASC
                 LIMIT %s
                 """,
-                (max_messages,)
+                (now, now, max_messages)
             )
 
             if not messages:
@@ -487,6 +791,9 @@ class DiscoveryService:
                 try:
                     self._deliver_single_message(msg)
                     delivered += 1
+                except PermanentDeliveryFailure as e:
+                    logger.error(f"Message {msg['message_id']} permanently failed: {e}")
+                    failed += 1
                 except Exception as e:
                     logger.error(f"Failed to deliver message {msg['message_id']}: {e}")
                     # Circuit breaker is recorded in _deliver_single_message
@@ -524,7 +831,13 @@ class DiscoveryService:
         if not peer or not peer['circuit_open_until']:
             return True
 
-        if peer['circuit_open_until'] <= datetime.now(timezone.utc):
+        try:
+            open_until = _parse_timestamp(peer['circuit_open_until'], "circuit_open_until")
+        except ValueError:
+            logger.warning("Invalid circuit breaker timestamp for %s; closing circuit", server_id)
+            open_until = datetime.now(timezone.utc)
+
+        if open_until <= datetime.now(timezone.utc):
             # Timeout expired - reset circuit
             self.db.execute_update(
                 "UPDATE lattice_peers SET circuit_failures = 0, circuit_open_until = NULL WHERE server_id = %s",
@@ -533,7 +846,7 @@ class DiscoveryService:
             logger.info(f"Circuit breaker timeout expired for {server_id} - closing circuit")
             return True
 
-        logger.warning(f"Circuit breaker OPEN for {server_id} - skipping delivery until {peer['circuit_open_until']}")
+        logger.warning(f"Circuit breaker OPEN for {server_id} - skipping delivery until {open_until.isoformat()}")
         return False
 
     def _record_delivery_success(self, server_id: str) -> None:
@@ -559,12 +872,43 @@ class DiscoveryService:
             open_until = datetime.now(timezone.utc) + self._circuit_breaker_timeout
             self.db.execute_update(
                 "UPDATE lattice_peers SET circuit_open_until = %s WHERE server_id = %s",
-                (open_until, server_id)
+                (open_until.isoformat(), server_id)
             )
             logger.error(
                 f"Circuit breaker OPENED for {server_id} after {result[0]['circuit_failures']} "
                 f"consecutive failures - blocking until {open_until}"
             )
+
+    def _verify_delivery_ack(
+        self,
+        ack_data: Dict[str, Any],
+        *,
+        message_id: str,
+        server_id: str,
+        recipient_public_key: str
+    ) -> MessageAcknowledgment:
+        """Validate the signed acknowledgment returned by a recipient server."""
+        if not ack_data:
+            raise ValueError("Remote server did not return a signed acknowledgment")
+
+        ack_obj = MessageAcknowledgment(**ack_data)
+        if ack_obj.message_id != message_id:
+            raise ValueError("Acknowledgment message_id mismatch")
+        if ack_obj.recipient_server != server_id:
+            raise ValueError("Acknowledgment recipient_server mismatch")
+
+        valid_success = ack_obj.status == "delivered" and ack_obj.ack_type == "message_received"
+        valid_rejection = ack_obj.status == "rejected" and ack_obj.ack_type == "message_failed"
+        if not valid_success and not valid_rejection:
+            raise ValueError("Remote server returned an invalid acknowledgment status")
+
+        _validate_fresh_timestamp(ack_obj.timestamp, "acknowledgment", max_age=timedelta(minutes=15))
+
+        ack_dict = ack_obj.model_dump(exclude={'signature'})
+        if not self.gossip_protocol.verify_signature(ack_dict, ack_obj.signature, recipient_public_key):
+            raise ValueError("Acknowledgment signature verification failed")
+
+        return ack_obj
 
     def _deliver_single_message(self, msg: Dict[str, Any]) -> None:
         """
@@ -592,14 +936,15 @@ class DiscoveryService:
         if not self._check_circuit_breaker(server_id):
             raise ValueError(f"Circuit breaker open for {server_id}")
 
-        if peer['trust_status'] == 'blocked':
+        if peer['trust_status'] in {'blocked', 'revoked'}:
             self._fail_message_permanently(message_id, "Recipient server is blocked")
-            return
+            raise PermanentDeliveryFailure("Recipient server is blocked")
 
         # Update status to sending
+        now = _now_iso()
         self.db.execute_update(
-            "UPDATE lattice_messages SET status = 'sending', last_status_change_at = datetime('now') WHERE message_id = %s",
-            (message_id,)
+            "UPDATE lattice_messages SET status = 'sending', last_status_change_at = %s WHERE message_id = %s",
+            (now, message_id)
         )
 
         # Get federation endpoint
@@ -632,26 +977,41 @@ class DiscoveryService:
             message.model_dump()
         )
 
-        if response and response.get('status') == 'accepted':
-            # Verify signed acknowledgment if present
-            ack = response.get('ack')
-            if ack:
-                from .models import MessageAcknowledgment
-                ack_obj = MessageAcknowledgment(**ack)
-                ack_dict = ack_obj.model_dump(exclude={'signature'})
-                recipient_public_key = peer.get('public_key')
-                if recipient_public_key:
-                    if not self.gossip_protocol.verify_signature(ack_dict, ack_obj.signature, recipient_public_key):
-                        logger.warning(f"Invalid ack signature from {server_id} - possible MITM")
-                        self._record_delivery_failure(server_id)
-                        raise ValueError("Acknowledgment signature verification failed")
+        if not response:
+            self._record_delivery_failure(server_id)
+            raise ValueError("Remote server did not return a delivery response")
+
+        recipient_public_key = peer.get('public_key')
+        if not recipient_public_key:
+            self._record_delivery_failure(server_id)
+            raise ValueError("Recipient public key unavailable")
+
+        try:
+            ack = self._verify_delivery_ack(
+                response.get('ack') or {},
+                message_id=message_id,
+                server_id=server_id,
+                recipient_public_key=recipient_public_key
+            )
+        except ValueError as exc:
+            logger.warning(f"Invalid ack from {server_id}: {exc}")
+            self._record_delivery_failure(server_id)
+            raise
+
+        if ack.status == 'delivered':
             # Mark as delivered and reset circuit breaker
             self._record_delivery_success(server_id)
-            self._complete_message(message_id)
+            self._complete_message(message_id, response.get('ack'))
             logger.info(f"Message {message_id} delivered to {server_id}")
-        else:
-            self._record_delivery_failure(server_id)
-            raise ValueError(f"Remote server rejected message: {response}")
+            return
+
+        if ack.status == 'rejected':
+            reason = ack.error_message or "Remote server rejected message"
+            self._fail_message_permanently(message_id, reason, ack_data=response.get('ack'))
+            raise PermanentDeliveryFailure(reason)
+
+        self._record_delivery_failure(server_id)
+        raise ValueError(f"Remote server response and acknowledgment disagree: {response.get('status')}/{ack.status}")
 
     def _send_to_remote_server(self, url: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
@@ -667,6 +1027,10 @@ class DiscoveryService:
         import httpx
 
         try:
+            parsed = urlparse(url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            _validate_endpoint_url(base_url)
+
             with httpx.Client(timeout=30.0) as client:
                 response = client.post(url, json=data)
 
@@ -702,6 +1066,7 @@ class DiscoveryService:
             # Schedule retry with exponential backoff (capped at 60 minutes)
             backoff_minutes = min(2 ** attempt_count, 60)  # 2, 4, 8, 16, 32, 60 minutes max
             next_attempt = datetime.now(timezone.utc) + timedelta(minutes=backoff_minutes)
+            now = _now_iso()
 
             self.db.execute_update(
                 """
@@ -711,38 +1076,65 @@ class DiscoveryService:
                     next_attempt_at = %s,
                     last_error = %s,
                     error_count = error_count + 1,
-                    last_status_change_at = datetime('now')
+                    last_status_change_at = %s
                 WHERE message_id = %s
                 """,
-                (attempt_count, next_attempt.isoformat(), error, message_id)
+                (attempt_count, next_attempt.isoformat(), error, now, message_id)
             )
 
             logger.info(f"Message {message_id} retry scheduled for {next_attempt} (attempt {attempt_count}/{max_attempts})")
 
-    def _complete_message(self, message_id: str) -> None:
+    def _complete_message(self, message_id: str, ack_data: Optional[Dict[str, Any]] = None) -> None:
         """Mark message as successfully delivered."""
+        now = _now_iso()
         self.db.execute_update(
             """
             UPDATE lattice_messages
             SET status = 'delivered',
-                delivered_at = datetime('now'),
-                last_status_change_at = datetime('now')
+                delivered_at = %s,
+                last_status_change_at = %s,
+                ack_received = 1,
+                ack_received_at = %s,
+                ack_data = %s
             WHERE message_id = %s
             """,
-            (message_id,)
+            (now, now, now, json.dumps(ack_data or {}), message_id)
         )
 
-    def _fail_message_permanently(self, message_id: str, error: str) -> None:
+    def _fail_message_permanently(
+        self,
+        message_id: str,
+        error: str,
+        ack_data: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Mark message as permanently failed."""
+        now = _now_iso()
+        if ack_data:
+            self.db.execute_update(
+                """
+                UPDATE lattice_messages
+                SET status = 'failed',
+                    last_error = %s,
+                    last_status_change_at = %s,
+                    ack_received = 1,
+                    ack_received_at = %s,
+                    ack_data = %s
+                WHERE message_id = %s
+                """,
+                (error, now, now, json.dumps(ack_data), message_id)
+            )
+            logger.error(f"Message {message_id} permanently failed: {error}")
+            return
+
         self.db.execute_update(
             """
             UPDATE lattice_messages
             SET status = 'failed',
                 last_error = %s,
-                last_status_change_at = datetime('now')
+                last_status_change_at = %s
             WHERE message_id = %s
             """,
-            (error, message_id)
+            (error, now, message_id)
         )
 
         logger.error(f"Message {message_id} permanently failed: {error}")
@@ -787,21 +1179,30 @@ class DiscoveryService:
 
         # Extract destination domain
         _, to_domain = to_address.split('@', 1)
+        _, from_domain = from_address.split('@', 1)
 
         # Generate message ID
         message_id = str(uuid.uuid4())
 
         # Get sender fingerprint from our identity
         identity = self.db.execute_single(
-            "SELECT fingerprint FROM lattice_identity WHERE id = 1"
+            "SELECT server_id, fingerprint FROM lattice_identity WHERE id = 1"
         )
         if not identity:
             raise ValueError("No federation identity configured")
 
         sender_fingerprint = identity['fingerprint']
+        local_server_id = self.gossip_protocol.get_server_id() or identity.get('server_id')
+        if from_domain.lower() != local_server_id.lower():
+            raise ValueError("from_address must use this server's domain")
+
+        if message_type not in {"pager", "location", "ai_to_ai"}:
+            raise ValueError("Invalid message_type")
+
+        _validate_json_size(metadata or {}, MAX_METADATA_BYTES, "metadata")
 
         # Create message dict for signing (excluding signature field)
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = _now_iso()
         message_dict = {
             "version": "1.0",
             "message_id": message_id,
@@ -821,6 +1222,7 @@ class DiscoveryService:
 
         # Calculate expiry (24 hours)
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        now = _now_iso()
 
         # Insert into queue
         import json
@@ -836,8 +1238,8 @@ class DiscoveryService:
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s,
-                'pending', 0, 5, datetime('now'),
-                datetime('now'), %s
+                'pending', 0, 5, %s,
+                %s, %s
             )
             """,
             (
@@ -852,6 +1254,8 @@ class DiscoveryService:
                 json.dumps(metadata or {}),
                 signature,
                 sender_fingerprint,
+                now,
+                now,
                 expires_at
             )
         )
@@ -888,6 +1292,8 @@ class DiscoveryService:
             try:
                 self._deliver_single_message(msg)
                 logger.info(f"Immediate delivery succeeded for message {message_id}")
+            except PermanentDeliveryFailure as e:
+                logger.warning(f"Immediate delivery permanently failed for {message_id}: {e}")
             except Exception as e:
                 logger.warning(f"Immediate delivery failed for {message_id}: {e}")
                 self._handle_delivery_failure(msg, str(e))
@@ -920,7 +1326,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
-
+app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=MAX_REQUEST_BODY_BYTES)
 
 
 # =====================================================================
@@ -938,7 +1344,7 @@ async def public_status():
     try:
         # Get peer count
         peer_count_result = discovery_service.db.execute_single(
-            "SELECT COUNT(*) as count FROM lattice_peers WHERE trust_status != 'blocked'"
+            "SELECT COUNT(*) as count FROM lattice_peers WHERE trust_status NOT IN ('blocked', 'revoked')"
         )
         peer_count = peer_count_result['count'] if peer_count_result else 0
 
@@ -963,14 +1369,15 @@ async def public_status():
 
 
 @app.get("/health")
-async def health_check(_: str = Depends(localhost_only)):
+async def health_check(_: str = Depends(admin_only)):
     """
-    Detailed health check endpoint (localhost only).
+    Detailed health check endpoint for admin-token authenticated callers.
 
     Returns granular operational details for internal monitoring,
     admin tools, and the main application checking on the daemon.
     """
     try:
+        now = _now_iso()
         # Get queue statistics
         queue_stats = discovery_service.db.execute_single(
             """
@@ -979,8 +1386,9 @@ async def health_check(_: str = Depends(localhost_only)):
                 COUNT(CASE WHEN status = 'sending' THEN 1 END) as sending,
                 COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
             FROM lattice_messages
-            WHERE expires_at > datetime('now')
-            """
+            WHERE expires_at > %s
+            """,
+            (now,)
         )
 
         # Get circuit breaker statistics
@@ -988,10 +1396,11 @@ async def health_check(_: str = Depends(localhost_only)):
             """
             SELECT
                 COUNT(*) as total_peers,
-                COUNT(CASE WHEN circuit_open_until > datetime('now') THEN 1 END) as open_circuits
+                COUNT(CASE WHEN circuit_open_until > %s THEN 1 END) as open_circuits
             FROM lattice_peers
-            WHERE trust_status != 'blocked'
-            """
+            WHERE trust_status NOT IN ('blocked', 'revoked')
+            """,
+            (now,)
         )
 
         # Calculate uptime
@@ -1026,7 +1435,7 @@ async def health_check(_: str = Depends(localhost_only)):
 
 
 @app.get("/api/v1/identity")
-async def get_server_identity():
+async def get_server_identity(_: str = Depends(admin_only)):
     """Get this server's federation identity."""
     try:
         identity = discovery_service.db.execute_single(
@@ -1050,7 +1459,7 @@ async def get_server_identity():
         raise
     except Exception as e:
         logger.error(f"Error getting identity: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to get identity")
 
 
 @app.get("/api/v1/announcement")
@@ -1069,11 +1478,15 @@ async def get_server_announcement():
 
     except Exception as e:
         logger.error(f"Error creating announcement: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to create announcement")
 
 
 @app.post("/api/v1/announce")
-async def announce_server(request: AnnouncementRequest, background_tasks: BackgroundTasks):
+async def announce_server(
+    request: AnnouncementRequest,
+    background_tasks: BackgroundTasks,
+    _: str = Depends(admin_only)
+):
     """Announce local server to the network."""
     try:
         # Check if we recently announced
@@ -1096,16 +1509,16 @@ async def announce_server(request: AnnouncementRequest, background_tasks: Backgr
 
     except Exception as e:
         logger.error(f"Error in announce endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to schedule announcement")
 
 
 @app.get("/api/v1/peers")
 async def list_peers(
-    _: str = Depends(localhost_only),
+    _: str = Depends(admin_only),
     active_only: bool = True,
     include_blocked: bool = False
 ) -> List[PeerStatus]:
-    """Get list of known peer servers (localhost only)."""
+    """Get list of known peer servers for admin-token authenticated callers."""
     try:
         query = """
             SELECT server_id, is_neighbor, trust_status,
@@ -1117,10 +1530,10 @@ async def list_peers(
 
         if active_only:
             query += " AND last_seen_at > %s"
-            params.append(datetime.now(timezone.utc) - timedelta(days=7))
+            params.append((datetime.now(timezone.utc) - timedelta(days=7)).isoformat())
 
         if not include_blocked:
-            query += " AND trust_status != 'blocked'"
+            query += " AND trust_status NOT IN ('blocked', 'revoked')"
 
         query += " ORDER BY is_neighbor DESC, last_seen_at DESC"
 
@@ -1131,7 +1544,7 @@ async def list_peers(
                 server_id=p['server_id'],
                 is_neighbor=p['is_neighbor'],
                 trust_status=p['trust_status'],
-                last_seen=p['last_seen_at'].isoformat(),
+                last_seen=p['last_seen_at'].isoformat() if hasattr(p['last_seen_at'], "isoformat") else p['last_seen_at'],
                 endpoints=p['endpoints']
             )
             for p in peers
@@ -1139,13 +1552,20 @@ async def list_peers(
 
     except Exception as e:
         logger.error(f"Error listing peers: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to list peers")
 
 
 @app.post("/api/v1/domain/query")
 async def handle_domain_query(query: DomainQuery) -> DomainResponse:
     """Handle incoming domain query from another server (for forwarding)."""
     try:
+        requester = discovery_service._get_known_peer_for_query(query.requester)
+        if not requester:
+            raise HTTPException(status_code=403, detail="Unknown requester")
+
+        if not discovery_service._verify_domain_query(query, requester):
+            raise HTTPException(status_code=403, detail="Invalid domain query signature")
+
         # Check for duplicate query (prevents loops in circular topologies)
         if query.query_id in discovery_service._processed_queries:
             logger.debug(f"Ignoring duplicate query {query.query_id} for domain {query.domain}")
@@ -1170,15 +1590,39 @@ async def handle_domain_query(query: DomainQuery) -> DomainResponse:
 
         if response:
             # We have an answer (either found or not found after max hops)
-            return response
+            if not response.found:
+                return response
+
+            validated = discovery_service._validate_domain_response(
+                response,
+                query,
+                {
+                    "server_id": discovery_service.gossip_protocol.get_server_id(),
+                    "trust_status": "trusted"
+                }
+            )
+            if validated:
+                return validated
+            return DomainResponse(query_id=query.query_id, domain=query.domain, found=False, hop_count=0)
 
         # No answer and hops remaining - forward to subset of neighbors (limit amplification)
-        query.max_hops -= 1
+        local_server_id = discovery_service.gossip_protocol.get_server_id()
+        if not local_server_id:
+            raise HTTPException(status_code=503, detail="Federation identity not configured")
+
+        forward_query = query.model_copy(update={
+            "requester": local_server_id,
+            "max_hops": query.max_hops - 1,
+            "timestamp": _now_iso(),
+            "signature": ""
+        })
+        discovery_service._sign_domain_query(forward_query)
+
         neighbors = discovery_service.peer_manager.get_active_neighbors()
 
         # Limit fan-out to 3 neighbors to prevent query amplification attacks
         import httpx
-        sampled_neighbors = random.sample(neighbors, min(3, len(neighbors))) if neighbors else []
+        sampled_neighbors = discovery_service._rng.sample(neighbors, min(3, len(neighbors))) if neighbors else []
         with httpx.Client(timeout=3.0) as client:
             for neighbor in sampled_neighbors:
                 try:
@@ -1190,18 +1634,25 @@ async def handle_domain_query(query: DomainQuery) -> DomainResponse:
                     if neighbor['server_id'] == query.requester:
                         continue
 
+                    _validate_endpoint_url(endpoint)
+
                     # Forward query to neighbor
                     forward_response = client.post(
                         f"{endpoint}/api/v1/domain/query",
-                        json=query.model_dump()
+                        json=forward_query.model_dump()
                     )
 
                     if forward_response.status_code == 200:
                         result = DomainResponse(**forward_response.json())
-                        if result.found:
+                        validated = discovery_service._validate_domain_response(
+                            result,
+                            forward_query,
+                            neighbor
+                        )
+                        if validated and validated.found:
                             # Cache the result before returning
-                            discovery_service.gossip_protocol._handle_domain_response(result)
-                            return result
+                            discovery_service.gossip_protocol._handle_domain_response(validated)
+                            return validated
 
                 except Exception as e:
                     logger.debug(f"Forward to {neighbor['server_id']} failed: {e}")
@@ -1212,16 +1663,18 @@ async def handle_domain_query(query: DomainQuery) -> DomainResponse:
             query_id=query.query_id,
             domain=query.domain,
             found=False,
-            hop_count=query.max_hops
+            hop_count=forward_query.max_hops
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error handling domain query: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to handle domain query")
 
 
 @app.post("/api/v1/route/{domain}")
-async def resolve_route(domain: str) -> RouteQueryResponse:
+async def resolve_route(domain: str, _: str = Depends(admin_only)) -> RouteQueryResponse:
     """Resolve a domain to a server endpoint."""
     try:
         # Check blocklist first
@@ -1245,14 +1698,15 @@ async def resolve_route(domain: str) -> RouteQueryResponse:
                 from_cache=True
             )
 
-        # Not in cache - initiate discovery query to neighbors
+        # Not in cache - ask known neighbors for routes to already-known peers.
         query_id = f"QUERY-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
         query = DomainQuery(
             query_id=query_id,
             domain=domain,
             requester=discovery_service.gossip_protocol.get_server_id() or "unknown",
-            max_hops=10  # High hop count for thorough domain resolution
+            max_hops=10  # High hop count for known-peer route validation
         )
+        discovery_service._sign_domain_query(query)
 
         # Process query locally first (checks our cache)
         local_response = discovery_service.gossip_protocol._handle_domain_query(
@@ -1271,7 +1725,8 @@ async def resolve_route(domain: str) -> RouteQueryResponse:
                 from_cache=True
             )
 
-        # Not in cache - query neighbors with forwarding
+        # Not in cache - query neighbors with forwarding, but only accept routes
+        # that match trusted local peer records.
         neighbors = discovery_service.peer_manager.get_active_neighbors()
         if not neighbors:
             logger.warning(f"No neighbors available to query for domain {domain}")
@@ -1282,17 +1737,24 @@ async def resolve_route(domain: str) -> RouteQueryResponse:
             )
 
         # Decrement hops for forwarding
-        query.max_hops -= 1
+        query = query.model_copy(update={
+            "max_hops": query.max_hops - 1,
+            "timestamp": _now_iso(),
+            "signature": ""
+        })
+        discovery_service._sign_domain_query(query)
 
         # Query subset of neighbors to limit amplification
         import httpx
-        sampled_neighbors = random.sample(neighbors, min(3, len(neighbors)))
+        sampled_neighbors = discovery_service._rng.sample(neighbors, min(3, len(neighbors)))
         with httpx.Client(timeout=5.0) as client:
             for neighbor in sampled_neighbors:
                 try:
                     endpoint = neighbor['endpoints'].get('discovery')
                     if not endpoint:
                         continue
+
+                    _validate_endpoint_url(endpoint)
 
                     response = client.post(
                         f"{endpoint}/api/v1/domain/query",
@@ -1302,16 +1764,21 @@ async def resolve_route(domain: str) -> RouteQueryResponse:
 
                     if response.status_code == 200:
                         result = DomainResponse(**response.json())
-                        if result.found:
-                            # Cache the result
-                            discovery_service.gossip_protocol._handle_domain_response(result)
+                        validated = discovery_service._validate_domain_response(
+                            result,
+                            query,
+                            neighbor
+                        )
+                        if validated and validated.found:
+                            # Cache the validated known-peer route.
+                            discovery_service.gossip_protocol._handle_domain_response(validated)
 
                             return RouteQueryResponse(
                                 found=True,
                                 domain=domain,
-                                server_id=result.server_id,
-                                endpoint_url=result.endpoint_url,
-                                confidence=result.confidence,
+                                server_id=validated.server_id,
+                                endpoint_url=validated.endpoint_url,
+                                confidence=validated.confidence,
                                 from_cache=False
                             )
 
@@ -1328,7 +1795,7 @@ async def resolve_route(domain: str) -> RouteQueryResponse:
 
     except Exception as e:
         logger.error(f"Error resolving route for {domain}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to resolve route")
 
 
 @app.post("/api/v1/gossip/receive")
@@ -1352,7 +1819,7 @@ async def receive_gossip(message: GossipMessage):
                         ELSE rate_limit_reset_at
                     END
                 WHERE server_id = %s
-                RETURNING public_key, server_uuid, query_count
+                RETURNING public_key, server_uuid, trust_status, query_count
                 """,
                 (message.from_server,)
             )
@@ -1366,13 +1833,21 @@ async def receive_gossip(message: GossipMessage):
             logger.warning(f"Rate limit exceeded for gossip from {message.from_server} (count: {sender['query_count']})")
             raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
+        if sender and sender.get('trust_status') in {'blocked', 'revoked'}:
+            raise HTTPException(status_code=403, detail="Sender is blocked")
+
         # For announcements, verify public key authenticity
         if message.message_type == "announcement":
             from .models import ServerAnnouncement
             announcement = ServerAnnouncement(**message.payload)
 
+            if announcement.server_id != message.from_server:
+                raise HTTPException(status_code=403, detail="Announcement sender mismatch")
+
             # If we already know this server, verify the public key hasn't changed
             if sender:
+                if str(sender['server_uuid']) != announcement.server_uuid:
+                    raise HTTPException(status_code=403, detail="Announcement UUID mismatch")
                 if sender['public_key'] != announcement.public_key:
                     logger.error(
                         f"Public key mismatch for {message.from_server}: "
@@ -1381,15 +1856,14 @@ async def receive_gossip(message: GossipMessage):
                     raise HTTPException(status_code=403, detail="Public key verification failed")
                 sender_public_key = sender['public_key']  # Use known public key
             else:
-                # Unknown server - only accept if from bootstrap servers
-                # NOTE: Bootstrap servers (configured in LATTICE_BOOTSTRAP_SERVERS) are trusted on
-                # first contact - their public keys are accepted without out-of-band verification.
-                # This is a config-time trust decision: only configure bootstrap servers you control
-                # or have verified. If a bootstrap server is compromised at first contact, an
-                # attacker could inject arbitrary identities. Future enhancement: add key pinning
-                # (fingerprint alongside URL in config). Contributions welcome.
-                bootstrap_domains = [urlparse(url).hostname for url in discovery_service.bootstrap_servers if urlparse(url).hostname]
-                if message.from_server not in bootstrap_domains:
+                # Unknown server announcements are accepted only from pinned bootstrap servers.
+                bootstrap_url = None
+                for candidate in discovery_service.bootstrap_servers:
+                    if (urlparse(candidate).hostname or "").lower() == announcement.server_id:
+                        bootstrap_url = candidate
+                        break
+
+                if not bootstrap_url:
                     logger.warning(
                         f"Rejecting announcement from unknown server '{message.from_server}'. "
                         f"New servers must be introduced by bootstrap or trusted peers."
@@ -1398,10 +1872,23 @@ async def receive_gossip(message: GossipMessage):
                         status_code=403,
                         detail="Unknown sender - new servers must be introduced via trusted path"
                     )
+
+                ann_dict = announcement.model_dump(exclude={'signature'})
+                if not discovery_service.gossip_protocol.verify_signature(
+                    ann_dict,
+                    announcement.signature,
+                    announcement.public_key
+                ):
+                    raise HTTPException(status_code=403, detail="Invalid bootstrap announcement signature")
+
+                if not discovery_service._verify_bootstrap_pin(bootstrap_url, announcement):
+                    raise HTTPException(status_code=403, detail="Bootstrap fingerprint verification failed")
                 sender_public_key = announcement.public_key  # First contact from bootstrap
         elif message.message_type == "key_rotation":
             from .models import KeyRotation
             rotation = KeyRotation(**message.payload)
+            if not sender:
+                raise HTTPException(status_code=403, detail="Unknown sender cannot rotate keys")
             # Key rotation: verify with OLD key in message (peer_manager validates it matches stored)
             sender_public_key = rotation.old_public_key
 
@@ -1413,6 +1900,8 @@ async def receive_gossip(message: GossipMessage):
                 raise HTTPException(status_code=403, detail="Unknown sender cannot revoke")
             if str(sender['server_uuid']) != revocation.server_uuid:
                 raise HTTPException(status_code=403, detail="UUID mismatch in revocation")
+            if revocation.server_id != message.from_server:
+                raise HTTPException(status_code=403, detail="Revocation sender mismatch")
             sender_public_key = sender['public_key']
 
         else:
@@ -1438,7 +1927,7 @@ async def receive_gossip(message: GossipMessage):
         raise
     except Exception as e:
         logger.error(f"Error receiving gossip: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to receive gossip")
 
 
 @app.post("/api/v1/federation/messages/receive")
@@ -1457,11 +1946,24 @@ async def receive_federated_message(message: FederatedMessage) -> InboundMessage
     import httpx
 
     try:
-        # Extract sender domain from from_address
-        if '@' not in message.from_address:
-            raise HTTPException(status_code=400, detail="Invalid from_address format")
-
         _, sender_domain = message.from_address.split('@', 1)
+        recipient_username, recipient_domain = message.to_address.split('@', 1)
+
+        local_server_id = discovery_service.gossip_protocol.get_server_id()
+        if not local_server_id:
+            raise HTTPException(status_code=503, detail="Federation identity not configured")
+        if recipient_domain.lower() != local_server_id.lower():
+            logger.warning(
+                "Rejected message %s addressed to non-local domain %s",
+                message.message_id,
+                recipient_domain
+            )
+            raise HTTPException(status_code=403, detail="Recipient domain is not local")
+
+        try:
+            _validate_fresh_timestamp(message.timestamp, "message", max_age=timedelta(hours=24))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
         # FASTPATH: Single atomic query that:
         # 1. Updates rate limit counter
@@ -1494,7 +1996,7 @@ async def receive_federated_message(message: FederatedMessage) -> InboundMessage
         # FAIL CLOSED: No result means unknown peer OR database issue
         if not sender:
             logger.warning(f"Received message from unknown server: {sender_domain}")
-            raise HTTPException(status_code=403, detail=f"Unknown sender server: {sender_domain}")
+            raise HTTPException(status_code=403, detail="Unknown sender server")
 
         # FASTPATH EXIT: Check rate limit immediately after atomic update
         if sender['query_count'] > 100:
@@ -1502,9 +2004,15 @@ async def receive_federated_message(message: FederatedMessage) -> InboundMessage
             raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
         # Now safe to do more expensive checks
-        if sender['trust_status'] == 'blocked':
+        if sender['trust_status'] in {'blocked', 'revoked'}:
             logger.warning(f"Rejecting message from blocked server: {sender_domain}")
             raise HTTPException(status_code=403, detail="Sender server is blocked")
+
+        expected_fingerprint = discovery_service.gossip_protocol.generate_fingerprint(sender['public_key'])
+        supplied_fingerprint = message.sender_fingerprint.replace(":", "").upper()
+        if not hmac.compare_digest(expected_fingerprint, supplied_fingerprint):
+            logger.error(f"Fingerprint mismatch on message {message.message_id} from {sender_domain}")
+            raise HTTPException(status_code=403, detail="Sender fingerprint mismatch")
 
         # Verify message signature
         message_dict = message.model_dump(exclude={'signature'})
@@ -1518,73 +2026,113 @@ async def receive_federated_message(message: FederatedMessage) -> InboundMessage
 
         # Check for duplicate message (idempotency)
         existing = discovery_service.db.execute_single(
-            "SELECT message_id FROM lattice_received_messages WHERE message_id = %s",
+            "SELECT status, ack_data FROM lattice_received_messages WHERE message_id = %s",
             (message.message_id,)
         )
 
         if existing:
             logger.info(f"Duplicate message {message.message_id} - already processed")
-            # Return success for idempotency (don't re-process, but acknowledge)
+            if existing.get('status') == 'processing':
+                raise HTTPException(status_code=409, detail="Message is already being processed")
+            ack_data = existing.get('ack_data') or {}
+            if isinstance(ack_data, str):
+                ack_data = json.loads(ack_data) if ack_data else {}
             return InboundMessageResponse(
-                status="accepted",
+                status="accepted" if existing.get('status') == 'accepted' else "rejected",
                 message_id=message.message_id,
-                ack=None  # No new ack for duplicates
+                ack=ack_data
             )
 
         # Record the message as received
-        discovery_service.db.execute_insert(
-            """
-            INSERT INTO lattice_received_messages (message_id, from_address, received_at)
-            VALUES (%s, %s, datetime('now'))
-            """,
-            (message.message_id, message.from_address)
-        )
+        now = _now_iso()
+        try:
+            discovery_service.db.execute_insert(
+                """
+                INSERT INTO lattice_received_messages (message_id, from_address, received_at, status)
+                VALUES (%s, %s, %s, 'processing')
+                """,
+                (message.message_id, message.from_address, now)
+            )
+        except Exception:
+            existing = discovery_service.db.execute_single(
+                "SELECT status, ack_data FROM lattice_received_messages WHERE message_id = %s",
+                (message.message_id,)
+            )
+            if existing:
+                if existing.get('status') == 'processing':
+                    raise HTTPException(status_code=409, detail="Message is already being processed")
+                ack_data = existing.get('ack_data') or {}
+                if isinstance(ack_data, str):
+                    ack_data = json.loads(ack_data) if ack_data else {}
+                return InboundMessageResponse(
+                    status="accepted" if existing.get('status') == 'accepted' else "rejected",
+                    message_id=message.message_id,
+                    ack=ack_data
+                )
+            raise
 
-        # Extract recipient username and resolve to user_id
-        if '@' not in message.to_address:
-            raise HTTPException(status_code=400, detail="Invalid to_address format")
-
-        recipient_username, _ = message.to_address.split('@', 1)
-
-        # Check if username resolver is configured
-        if not has_username_resolver():
-            logger.error("No username resolver configured - cannot deliver federated messages")
-            raise HTTPException(
-                status_code=503,
-                detail="Server not configured to receive federated messages"
+        def complete_received(status: str, ack: Dict[str, Any]) -> None:
+            completed_at = _now_iso()
+            discovery_service.db.execute_update(
+                """
+                UPDATE lattice_received_messages
+                SET status = %s,
+                    completed_at = %s,
+                    ack_data = %s
+                WHERE message_id = %s
+                """,
+                (status, completed_at, json.dumps(ack), message.message_id)
             )
 
-        # Resolve username to user_id
-        user_id = resolve_username(recipient_username)
-        if not user_id:
-            logger.warning(f"Unknown recipient username: {recipient_username}")
-            return InboundMessageResponse(
-                status="rejected",
-                message_id=message.message_id,
-                ack=_create_rejection_ack(message.message_id, f"Unknown recipient: {recipient_username}")
+        def release_received() -> None:
+            discovery_service.db.execute_delete(
+                "DELETE FROM lattice_received_messages WHERE message_id = %s AND status = 'processing'",
+                (message.message_id,)
             )
-
-        # Deliver via webhook
-        delivery_webhook = os.getenv("LATTICE_DELIVERY_WEBHOOK")
-        if not delivery_webhook:
-            logger.error("LATTICE_DELIVERY_WEBHOOK not configured")
-            raise HTTPException(
-                status_code=503,
-                detail="Delivery webhook not configured"
-            )
-
-        webhook_payload = {
-            "from_address": message.from_address,
-            "to_user_id": user_id,
-            "content": message.content,
-            "priority": message.priority,
-            "message_id": message.message_id,
-            "metadata": message.metadata,
-            "sender_verified": True,
-            "sender_server_id": sender_domain
-        }
 
         try:
+            # Check if username resolver is configured
+            if not has_username_resolver():
+                logger.error("No username resolver configured - cannot deliver federated messages")
+                release_received()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Server not configured to receive federated messages"
+                )
+
+            # Resolve username to user_id
+            user_id = resolve_username(recipient_username)
+            if not user_id:
+                logger.warning(f"Unknown recipient username: {recipient_username}")
+                ack = _create_rejection_ack(message.message_id, f"Unknown recipient: {recipient_username}")
+                complete_received("rejected", ack)
+                return InboundMessageResponse(
+                    status="rejected",
+                    message_id=message.message_id,
+                    ack=ack
+                )
+
+            # Deliver via webhook
+            delivery_webhook = os.getenv("LATTICE_DELIVERY_WEBHOOK") or load_config("DELIVERY_WEBHOOK")
+            if not delivery_webhook:
+                logger.error("LATTICE_DELIVERY_WEBHOOK not configured")
+                release_received()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Delivery webhook not configured"
+                )
+
+            webhook_payload = {
+                "from_address": message.from_address,
+                "to_user_id": user_id,
+                "content": message.content,
+                "priority": message.priority,
+                "message_id": message.message_id,
+                "metadata": message.metadata,
+                "sender_verified": True,
+                "sender_server_id": sender_domain
+            }
+
             with httpx.Client(timeout=30.0) as client:
                 response = client.post(delivery_webhook, json=webhook_payload)
 
@@ -1593,6 +2141,7 @@ async def receive_federated_message(message: FederatedMessage) -> InboundMessage
 
                     # Create signed acknowledgment
                     ack = _create_success_ack(message.message_id)
+                    complete_received("accepted", ack)
 
                     return InboundMessageResponse(
                         status="accepted",
@@ -1602,25 +2151,34 @@ async def receive_federated_message(message: FederatedMessage) -> InboundMessage
                 elif 400 <= response.status_code < 500:
                     # 4xx: Permanent rejection - bad message, don't retry
                     logger.warning(f"Webhook rejected message {message.message_id}: {response.status_code} - {response.text}")
+                    ack = _create_rejection_ack(message.message_id, f"Delivery rejected: {response.status_code}")
+                    complete_received("rejected", ack)
                     return InboundMessageResponse(
                         status="rejected",
                         message_id=message.message_id,
-                        ack=_create_rejection_ack(message.message_id, f"Delivery rejected: {response.status_code}")
+                        ack=ack
                     )
                 else:
                     # 5xx: Temporary failure - sender should retry
                     logger.error(f"Webhook server error for {message.message_id}: {response.status_code} - {response.text}")
+                    release_received()
                     raise HTTPException(status_code=502, detail=f"Delivery backend error: {response.status_code}")
 
         except httpx.TimeoutException:
             logger.error(f"Webhook timeout for message {message.message_id}")
+            release_received()
             raise HTTPException(status_code=504, detail="Delivery webhook timeout")
+        except HTTPException:
+            raise
+        except Exception:
+            release_received()
+            raise
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error receiving federated message: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to receive federated message")
 
 
 def _create_success_ack(message_id: str) -> Dict[str, Any]:
@@ -1668,13 +2226,13 @@ def _create_rejection_ack(message_id: str, reason: str) -> Dict[str, Any]:
 async def send_federated_message(
     request: SendMessageRequest,
     background_tasks: BackgroundTasks,
-    _: str = Depends(localhost_only)
+    _: str = Depends(admin_only)
 ) -> SendMessageResponse:
     """
     Queue and immediately attempt delivery of a federated message.
 
-    This endpoint is localhost-only, intended to be called by local applications
-    that want to send messages to users on remote Lattice servers.
+    This endpoint is admin-token protected and intended to be called by local
+    applications that want to send messages to users on remote Lattice servers.
 
     The message is:
     1. Signed with this server's private key
@@ -1709,11 +2267,15 @@ async def send_federated_message(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error queueing federated message: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to queue federated message")
 
 
 @app.post("/api/v1/domain/verify")
-async def verify_domain_availability(domain: str, server_uuid: str) -> DomainRegistrationResult:
+async def verify_domain_availability(
+    domain: str,
+    server_uuid: str,
+    _: str = Depends(admin_only)
+) -> DomainRegistrationResult:
     """
     Verify if a domain name is available for registration.
 
@@ -1730,11 +2292,11 @@ async def verify_domain_availability(domain: str, server_uuid: str) -> DomainReg
 
     except Exception as e:
         logger.error(f"Error verifying domain availability: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to verify domain availability")
 
 
 @app.post("/api/v1/domain/register")
-async def register_domain(request: DomainRegistrationRequest):
+async def register_domain(request: DomainRegistrationRequest, _: str = Depends(admin_only)):
     """
     Register a domain name for this server.
 
@@ -1760,7 +2322,7 @@ async def register_domain(request: DomainRegistrationRequest):
         raise
     except Exception as e:
         logger.error(f"Error registering domain: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to register domain")
 
 
 # =====================================================================
@@ -1797,11 +2359,11 @@ async def register_domain(request: DomainRegistrationRequest):
 
 @app.post("/api/v1/maintenance/update_neighbors")
 async def trigger_neighbor_update(
-    _: str = Depends(localhost_only),
+    _: str = Depends(admin_only),
     background_tasks: BackgroundTasks = None
 ):
     """
-    Trigger neighbor selection update (called by scheduler, localhost only).
+    Trigger neighbor selection update (called by admin-token authenticated scheduler).
 
     This endpoint is designed to be called by the main application's
     scheduler service rather than having the discovery daemon manage its own scheduling.
@@ -1814,13 +2376,13 @@ async def trigger_neighbor_update(
         }
     except Exception as e:
         logger.error(f"Error scheduling neighbor update: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to schedule neighbor update")
 
 
 @app.post("/api/v1/maintenance/process_messages")
-async def process_message_queue(_: str = Depends(localhost_only)):
+async def process_message_queue(_: str = Depends(admin_only)):
     """
-    Process pending federated messages for delivery (called by scheduler, localhost only).
+    Process pending federated messages for delivery (called by admin-token authenticated scheduler).
 
     This endpoint processes messages queued in the lattice_messages table
     and attempts to deliver them to remote servers.
@@ -1833,13 +2395,13 @@ async def process_message_queue(_: str = Depends(localhost_only)):
         }
     except Exception as e:
         logger.error(f"Error processing message queue: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to process message queue")
 
 
 @app.post("/api/v1/maintenance/cleanup")
-async def trigger_cleanup(_: str = Depends(localhost_only)):
+async def trigger_cleanup(_: str = Depends(admin_only)):
     """
-    Trigger cleanup of stale data (called by scheduler, localhost only).
+    Trigger cleanup of stale data (called by admin-token authenticated scheduler).
 
     This endpoint is designed to be called by the main application's
     scheduler service rather than having the discovery daemon manage its own scheduling.
@@ -1852,10 +2414,15 @@ async def trigger_cleanup(_: str = Depends(localhost_only)):
         }
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to run cleanup")
 
 
 if __name__ == "__main__":
     import uvicorn
     # Port 1113 for Lattice (all deployments)
-    uvicorn.run(app, host="0.0.0.0", port=1113, log_level="info")
+    uvicorn.run(
+        app,
+        host=os.getenv("LATTICE_BIND_HOST", "127.0.0.1"),
+        port=1113,
+        log_level="info"
+    )

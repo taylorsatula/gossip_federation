@@ -9,39 +9,10 @@ This module handles setup including:
 
 import logging
 import os
-import subprocess
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 
 from .sqlite_client import SQLiteClient
-
-
-def _secure_delete(filepath: str) -> None:
-    """
-    Securely delete a file by overwriting before removal.
-
-    Attempts to use 'shred' command if available (Linux), falls back to
-    manual overwrite with random data (portable, works on macOS).
-    """
-    try:
-        # Try shred first (Linux) - overwrites 3 times then removes
-        subprocess.run(
-            ['shred', '-u', '-z', filepath],
-            capture_output=True,
-            check=True
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # Fallback: manual overwrite with random data (portable)
-        try:
-            size = os.path.getsize(filepath)
-            with open(filepath, 'wb') as f:
-                f.write(os.urandom(size))  # Overwrite with random data
-                f.flush()
-                os.fsync(f.fileno())  # Force write to disk
-            os.unlink(filepath)
-        except Exception:
-            # Last resort: just delete
-            if os.path.exists(filepath):
-                os.unlink(filepath)
 
 
 from .secrets import load_config, save_private_key, get_private_key_path
@@ -98,12 +69,13 @@ def ensure_lattice_identity() -> Dict[str, Any]:
         server_uuid = str(uuid.uuid4())
 
         import json
+        now = datetime.now(timezone.utc).isoformat()
         db.execute_insert(
             """
             INSERT INTO lattice_identity
             (id, server_id, server_uuid, private_key_path, public_key, fingerprint,
              bootstrap_servers, created_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 suggested_domain,
@@ -111,7 +83,8 @@ def ensure_lattice_identity() -> Dict[str, Any]:
                 str(key_path),
                 public_pem,
                 fingerprint,
-                json.dumps([])  # Bootstrap servers can be added later
+                json.dumps([]),  # Bootstrap servers can be added later
+                now
             )
         )
 
@@ -183,11 +156,22 @@ def _register_lattice_scheduler_jobs(scheduler_service):
 
     discovery_daemon_url = "http://localhost:1113"
 
+    def admin_headers() -> Dict[str, str]:
+        token = os.getenv("LATTICE_ADMIN_TOKEN") or os.getenv("ADMIN_TOKEN") or load_config("ADMIN_TOKEN")
+        if not token:
+            logger.warning("Lattice admin token is not configured; scheduled daemon calls will be rejected")
+            return {}
+        return {"X-Lattice-Admin-Token": token}
+
     # Gossip announcement - every 10 minutes
     def call_gossip_endpoint():
         try:
             with httpx.Client(timeout=10.0) as client:
-                response = client.post(f"{discovery_daemon_url}/api/v1/announce", json={"force": False})
+                response = client.post(
+                    f"{discovery_daemon_url}/api/v1/announce",
+                    json={"force": False},
+                    headers=admin_headers()
+                )
                 if response.status_code == 200:
                     logger.info("Triggered gossip round")
                 else:
@@ -199,7 +183,10 @@ def _register_lattice_scheduler_jobs(scheduler_service):
     def call_neighbor_update_endpoint():
         try:
             with httpx.Client(timeout=10.0) as client:
-                response = client.post(f"{discovery_daemon_url}/api/v1/maintenance/update_neighbors")
+                response = client.post(
+                    f"{discovery_daemon_url}/api/v1/maintenance/update_neighbors",
+                    headers=admin_headers()
+                )
                 if response.status_code == 200:
                     logger.info("Triggered neighbor update")
                 else:
@@ -211,7 +198,10 @@ def _register_lattice_scheduler_jobs(scheduler_service):
     def call_cleanup_endpoint():
         try:
             with httpx.Client(timeout=10.0) as client:
-                response = client.post(f"{discovery_daemon_url}/api/v1/maintenance/cleanup")
+                response = client.post(
+                    f"{discovery_daemon_url}/api/v1/maintenance/cleanup",
+                    headers=admin_headers()
+                )
                 if response.status_code == 200:
                     logger.info("Triggered lattice cleanup")
                 else:
@@ -223,7 +213,10 @@ def _register_lattice_scheduler_jobs(scheduler_service):
     def call_message_processing_endpoint():
         try:
             with httpx.Client(timeout=30.0) as client:
-                response = client.post(f"{discovery_daemon_url}/api/v1/maintenance/process_messages")
+                response = client.post(
+                    f"{discovery_daemon_url}/api/v1/maintenance/process_messages",
+                    headers=admin_headers()
+                )
                 if response.status_code == 200:
                     result = response.json()
                     if result.get('processed', 0) > 0:
@@ -285,15 +278,17 @@ def get_federation_status() -> Dict[str, Any]:
             }
 
         # Get peer statistics
+        active_cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
         peer_stats = db.execute_single(
             """
             SELECT
                 COUNT(*) as total_peers,
                 SUM(CASE WHEN is_neighbor = 1 THEN 1 ELSE 0 END) as neighbors,
                 SUM(CASE WHEN trust_status = 'trusted' THEN 1 ELSE 0 END) as trusted_peers,
-                SUM(CASE WHEN last_seen_at > datetime('now', '-1 day') THEN 1 ELSE 0 END) as active_peers
+                SUM(CASE WHEN last_seen_at > %s THEN 1 ELSE 0 END) as active_peers
             FROM lattice_peers
-            """
+            """,
+            (active_cutoff,)
         )
 
         return {
