@@ -6,6 +6,7 @@ All messages are cryptographically signed for authenticity.
 """
 
 import ipaddress
+import json
 import socket
 import uuid
 from datetime import datetime, timezone
@@ -13,6 +14,24 @@ from typing import Dict, List, Optional, Literal, Any
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
+
+
+MAX_METADATA_BYTES = 8 * 1024
+MAX_LOCATION_BYTES = 4 * 1024
+MAX_GOSSIP_PAYLOAD_BYTES = 64 * 1024
+
+
+def _validate_json_size(value: Any, max_bytes: int, field_name: str) -> Any:
+    """Reject nested JSON fields that are too large to safely process."""
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be JSON serializable") from exc
+
+    if len(encoded.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{field_name} exceeds {max_bytes} bytes")
+
+    return value
 
 
 # =====================================================================
@@ -79,14 +98,18 @@ def _validate_endpoint_url(url: str) -> str:
     if not parsed.scheme:
         raise ValueError(f"Endpoint URL must include scheme (http/https): {url}")
 
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"Endpoint URL must use http or https scheme: {url}")
+    if parsed.scheme != "https":
+        raise ValueError(f"Endpoint URL must use https scheme: {url}")
 
     if not parsed.netloc:
         raise ValueError(f"Endpoint URL must include host: {url}")
 
-    # Extract hostname (remove port if present)
-    hostname = parsed.netloc.split(':')[0]
+    if parsed.username or parsed.password:
+        raise ValueError(f"Endpoint URL must not contain credentials: {url}")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"Endpoint URL must include host: {url}")
 
     if _is_internal_address(hostname):
         raise ValueError(
@@ -160,6 +183,20 @@ class FederatedMessage(BaseModel):
     location: Optional[Dict[str, Any]] = Field(default=None, description="Location data if applicable")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
 
+    @field_validator('location')
+    @classmethod
+    def validate_location_size(cls, v):
+        """Bound optional location payload size."""
+        if v is None:
+            return v
+        return _validate_json_size(v, MAX_LOCATION_BYTES, "location")
+
+    @field_validator('metadata')
+    @classmethod
+    def validate_metadata_size(cls, v):
+        """Bound metadata payload size."""
+        return _validate_json_size(v, MAX_METADATA_BYTES, "metadata")
+
     @field_validator('from_address', 'to_address')
     @classmethod
     def validate_address_format(cls, v):
@@ -200,8 +237,9 @@ class DomainQuery(BaseModel):
     query_id: str = Field(description="Unique query identifier")
     domain: str = Field(description="Domain to resolve (e.g., other-server.com)")
     requester: str = Field(description="Server making the query")
-    max_hops: int = Field(default=5, ge=1, le=10, description="Maximum hops for query (limited to prevent amplification)")
+    max_hops: int = Field(default=5, ge=1, le=20, description="Maximum hops for query (limited to prevent amplification)")
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    signature: str = Field(default="", description="Base64 signature of query content")
 
     @field_validator('domain')
     @classmethod
@@ -264,6 +302,12 @@ class GossipMessage(BaseModel):
     payload: Dict[str, Any] = Field(description="Message payload")
     from_server: str = Field(description="Server sending the gossip")
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @field_validator('payload')
+    @classmethod
+    def validate_payload_size(cls, v):
+        """Bound gossip payload size."""
+        return _validate_json_size(v, MAX_GOSSIP_PAYLOAD_BYTES, "payload")
 
 
 # =====================================================================

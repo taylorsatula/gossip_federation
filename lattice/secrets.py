@@ -147,6 +147,14 @@ def load_config(key: str) -> Optional[str]:
     if value:
         return value
 
+    config_content = _load_from_credentials("config")
+    if config_content:
+        config = _parse_config_env(config_content)
+        if key_upper in config:
+            return config[key_upper]
+        if f"LATTICE_{key_upper}" in config:
+            return config[f"LATTICE_{key_upper}"]
+
     # 2. Config file
     config_content = _load_from_file(DEFAULT_CONFIG_PATH)
     if config_content:
@@ -178,12 +186,13 @@ def save_private_key(private_key_pem: str, path: Path = None) -> Path:
 
     try:
         # Create directory if needed
-        if not path.parent.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            os.chmod(path.parent, 0o700)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
 
         # Write key with restricted permissions
-        path.write_text(private_key_pem)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(private_key_pem)
         os.chmod(path, 0o600)
 
         logger.info(f"Saved private key to {path}")

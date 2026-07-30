@@ -12,7 +12,7 @@ See git history for original implementation.
 """
 
 import logging
-import random
+import secrets as secrets_module
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
@@ -34,6 +34,7 @@ class PeerManager:
         """
         self.max_neighbors = max_neighbors
         self.db = SQLiteClient()
+        self._rng = secrets_module.SystemRandom()
         logger.info(f"PeerManager initialized with max_neighbors={max_neighbors}")
 
     def add_or_update_peer(self, announcement: ServerAnnouncement) -> bool:
@@ -62,7 +63,7 @@ class PeerManager:
             # Check if peer exists by UUID first (permanent identity)
             # Use FOR UPDATE to prevent race conditions during collision check
             existing_by_uuid = self.db.execute_single(
-                "SELECT id, server_id, trust_status FROM lattice_peers WHERE server_uuid = %(server_uuid)s FOR UPDATE",
+                "SELECT id, server_id, public_key, trust_status FROM lattice_peers WHERE server_uuid = %(server_uuid)s FOR UPDATE",
                 {'server_uuid': announcement.server_uuid}
             )
 
@@ -81,9 +82,24 @@ class PeerManager:
                 return False
 
             # Check blocklist
-            if existing_by_id and existing_by_id['trust_status'] == 'blocked':
+            if existing_by_id and existing_by_id['trust_status'] in {'blocked', 'revoked'}:
                 logger.warning(f"Ignoring announcement from blocked peer: {announcement.server_id}")
                 return False
+
+            if self.is_blocked(announcement.server_id):
+                logger.warning(f"Ignoring announcement for blocked identifier: {announcement.server_id}")
+                return False
+
+            if existing_by_uuid:
+                if existing_by_uuid['trust_status'] in {'blocked', 'revoked'}:
+                    logger.warning(f"Ignoring announcement from blocked peer UUID: {announcement.server_uuid}")
+                    return False
+                if existing_by_uuid['public_key'] != announcement.public_key:
+                    logger.error(
+                        "Rejecting announcement for %s: public key changed without key rotation",
+                        announcement.server_id
+                    )
+                    return False
 
             import json
             import uuid as uuid_module
@@ -151,7 +167,7 @@ class PeerManager:
                 SELECT server_id, endpoints, public_key, last_seen_at
                 FROM lattice_peers
                 WHERE is_neighbor = 1
-                  AND trust_status != 'blocked'
+                  AND trust_status NOT IN ('blocked', 'revoked')
                   AND last_seen_at > %(cutoff_time)s
                 ORDER BY last_seen_at DESC
                 """,
@@ -194,7 +210,7 @@ class PeerManager:
                 SELECT server_id
                 FROM lattice_peers
                 WHERE is_neighbor = 0
-                  AND trust_status != 'blocked'
+                  AND trust_status NOT IN ('blocked', 'revoked')
                   AND last_seen_at > %(cutoff_time)s
                 """,
                 {'cutoff_time': cutoff_time}
@@ -205,7 +221,7 @@ class PeerManager:
                 return
 
             # Randomly select from all eligible candidates (pure random for network diversity)
-            selected = random.sample(candidates, min(count, len(candidates)))
+            selected = self._rng.sample(candidates, min(count, len(candidates)))
 
             for peer in selected:
                 self.db.execute_update(
@@ -251,7 +267,7 @@ class PeerManager:
                 SELECT server_id
                 FROM lattice_peers
                 WHERE is_neighbor = 0
-                  AND trust_status != 'blocked'
+                  AND trust_status NOT IN ('blocked', 'revoked')
                   AND last_seen_at > %(cutoff_time)s
                 ORDER BY RANDOM()
                 LIMIT 1
@@ -263,7 +279,7 @@ class PeerManager:
                 return
 
             # Swap them (20% chance to actually rotate for stability)
-            if random.random() < 0.2:
+            if self._rng.random() < 0.2:
                 # Remove old neighbor
                 self.db.execute_update(
                     "UPDATE lattice_peers SET is_neighbor = 0 WHERE server_id = %(server_id)s",
@@ -298,7 +314,7 @@ class PeerManager:
             # First check if it matches a server_id directly
             peer = self.db.execute_single(
                 """
-                SELECT server_id, endpoints, public_key, trust_status
+                SELECT server_id, server_uuid, endpoints, public_key, trust_status
                 FROM lattice_peers
                 WHERE server_id = %s
                 """,
@@ -311,15 +327,15 @@ class PeerManager:
             # Check routing cache
             route = self.db.execute_single(
                 """
-                SELECT p.server_id, p.endpoints, p.public_key, p.trust_status
+                SELECT p.server_id, p.server_uuid, p.endpoints, p.public_key, p.trust_status
                 FROM lattice_routes r
                 JOIN lattice_peers p ON r.server_id = p.server_id
                 WHERE r.domain = %s
-                  AND r.expires_at > datetime('now')
+                  AND r.expires_at > %s
                 ORDER BY r.confidence DESC
                 LIMIT 1
                 """,
-                (domain.lower(),)
+                (domain.lower(), datetime.now(timezone.utc).isoformat())
             )
 
             return route
@@ -333,7 +349,7 @@ class PeerManager:
         try:
             # Check peer blocklist
             peer_blocked = self.db.execute_single(
-                "SELECT 1 FROM lattice_peers WHERE server_id = %s AND trust_status = 'blocked'",
+                "SELECT 1 FROM lattice_peers WHERE server_id = %s AND trust_status IN ('blocked', 'revoked')",
                 (server_id,)
             )
 
@@ -346,16 +362,16 @@ class PeerManager:
                 SELECT 1 FROM lattice_blocklist
                 WHERE blocked_identifier = %s
                   AND block_type IN ('server', 'domain')
-                  AND (expires_at IS NULL OR expires_at > datetime('now'))
+                  AND (expires_at IS NULL OR expires_at > %s)
                 """,
-                (server_id,)
+                (server_id, datetime.now(timezone.utc).isoformat())
             )
 
             return bool(blocked)
 
         except Exception as e:
             logger.error(f"Error checking if {server_id} is blocked: {e}")
-            return False  # Fail open for now
+            return True
 
     def cleanup_stale_peers(self, days: int = 30) -> int:
         """
@@ -423,6 +439,10 @@ class PeerManager:
                 logger.warning(f"Key rotation for unknown UUID: {rotation.server_uuid}")
                 return False
 
+            if peer['server_id'] != from_server:
+                logger.error("Key rotation rejected: from_server does not match stored peer")
+                return False
+
             # Verify old key matches what we have stored
             if peer['public_key'] != rotation.old_public_key:
                 logger.error(f"Key rotation rejected: old_public_key doesn't match stored key for {peer['server_id']}")
@@ -473,6 +493,10 @@ class PeerManager:
             if existing:
                 logger.info(f"UUID {revocation.server_uuid} already revoked")
                 return True
+
+            if revocation.server_id != from_server:
+                logger.error("Revocation rejected: from_server does not match revocation server_id")
+                return False
 
             # Add to revocations table
             import uuid as uuid_module

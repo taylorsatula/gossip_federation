@@ -25,7 +25,8 @@ from .models import (
     DomainQuery,
     DomainResponse,
     KeyRotation,
-    IdentityRevocation
+    IdentityRevocation,
+    _validate_endpoint_url
 )
 
 logger = logging.getLogger(__name__)
@@ -288,6 +289,13 @@ class GossipProtocol:
             # Route based on message type
             if message.message_type == "announcement":
                 announcement = ServerAnnouncement(**message.payload)
+                if announcement.server_id != message.from_server:
+                    logger.warning(
+                        "Announcement sender mismatch: envelope=%s payload=%s",
+                        message.from_server,
+                        announcement.server_id
+                    )
+                    return False
 
                 # Validate timestamp to prevent replay attacks
                 try:
@@ -317,6 +325,9 @@ class GossipProtocol:
 
             elif message.message_type == "peer_exchange":
                 exchange = PeerExchange(**message.payload)
+                if exchange.from_server != message.from_server:
+                    logger.warning("Peer exchange sender mismatch from %s", message.from_server)
+                    return False
                 # Verify exchange signature
                 exc_dict = exchange.model_dump(exclude={'signature'})
                 if not self.verify_signature(exc_dict, exchange.signature, sender_public_key):
@@ -366,11 +377,11 @@ class GossipProtocol:
                 SELECT r.server_id, r.endpoint_url, r.hop_count, r.confidence
                 FROM lattice_routes r
                 WHERE r.domain = %(domain)s
-                  AND r.expires_at > datetime('now')
+                  AND r.expires_at > %(now)s
                 ORDER BY r.confidence DESC
                 LIMIT 1
                 """,
-                {'domain': query.domain}
+                {'domain': query.domain, 'now': datetime.now(timezone.utc).isoformat()}
             )
 
             if route:
@@ -420,16 +431,41 @@ class GossipProtocol:
                 logger.info(f"Domain {response.domain} not found")
                 return True
 
+            if not response.server_id or not response.endpoint_url:
+                logger.warning("Rejected incomplete domain response for %s", response.domain)
+                return False
+
+            if response.server_id.lower() != response.domain.lower():
+                logger.warning(
+                    "Rejected domain response for %s claiming server_id %s",
+                    response.domain,
+                    response.server_id
+                )
+                return False
+
+            peer = self.peer_manager.get_peer_by_domain(response.server_id)
+            if not peer or peer.get('trust_status') in {'blocked', 'revoked'}:
+                logger.warning("Rejected route for unknown or blocked peer %s", response.server_id)
+                return False
+
+            trusted_endpoint = peer.get('endpoints', {}).get('federation')
+            if trusted_endpoint != response.endpoint_url:
+                logger.warning("Rejected route with untrusted endpoint for %s", response.server_id)
+                return False
+
+            _validate_endpoint_url(response.endpoint_url)
+
             # Cache the route (use INSERT OR REPLACE for SQLite upsert)
             import uuid as uuid_module
             expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+            now = datetime.now(timezone.utc).isoformat()
             self.db.execute_insert(
                 """
                 INSERT OR REPLACE INTO lattice_routes
                 (id, domain, server_id, endpoint_url, hop_count, confidence, expires_at, last_used_at)
                 VALUES (
                     COALESCE((SELECT id FROM lattice_routes WHERE domain = %(domain)s), %(new_id)s),
-                    %(domain)s, %(server_id)s, %(endpoint_url)s, %(hop_count)s, %(confidence)s, %(expires_at)s, datetime('now')
+                    %(domain)s, %(server_id)s, %(endpoint_url)s, %(hop_count)s, %(confidence)s, %(expires_at)s, %(last_used_at)s
                 )
                 """,
                 {
@@ -439,7 +475,8 @@ class GossipProtocol:
                     'endpoint_url': response.endpoint_url,
                     'hop_count': response.hop_count,
                     'confidence': response.confidence,
-                    'expires_at': expires_at
+                    'expires_at': expires_at,
+                    'last_used_at': now
                 }
             )
 
@@ -544,8 +581,8 @@ class GossipProtocol:
 
             # Update database
             self.db.execute_update(
-                "UPDATE lattice_identity SET public_key = %(key)s, rotated_at = datetime('now') WHERE id = 1",
-                {'key': new_public_pem}
+                "UPDATE lattice_identity SET public_key = %(key)s, rotated_at = %(rotated_at)s WHERE id = 1",
+                {'key': new_public_pem, 'rotated_at': datetime.now(timezone.utc).isoformat()}
             )
 
             # Reload identity
